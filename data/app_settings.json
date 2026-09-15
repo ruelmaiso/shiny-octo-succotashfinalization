@@ -1,4 +1,6 @@
 {
+  "teacher_bind_host": "0.0.0.0",
+  "teacher_connect_host": "192.168.1.157",
   "main_stream_profile": "720p",
   "preview_stream_profile": "240p",
   "recording_mode": "off",

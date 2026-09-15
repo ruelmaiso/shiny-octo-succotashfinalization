@@ -1,0 +1,15 @@
+{
+  "clients": [
+    {
+      "mac": "e7:3e:a7:2f:98:ba",
+      "hostname": "matilde",
+      "pc_id": "PC01"
+    },
+    {
+      "mac": "d0:c5:d3:a9:23:c2",
+      "hostname": "DESKTOP-S37OIV1",
+      "pc_id": "PC02"
+    }
+  ],
+  "next_id": 3
+}

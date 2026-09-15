@@ -1,9 +1,1 @@
-{
-  "PC04": {
-    "start_ts": 1786852807.8332155,
-    "duration_ms": 7200000,
-    "paused": false,
-    "paused_at_ts": null,
-    "paused_accum_ms": 0
-  }
-}
+{}

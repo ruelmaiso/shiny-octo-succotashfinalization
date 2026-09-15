@@ -601,7 +601,7 @@ class TeacherDeployServer:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind((NETWORK.teacher_host, NETWORK.control_port))
+                sock.bind((self.settings.teacher_bind_host, NETWORK.control_port))
                 sock.listen()
                 while True:
                     client_sock, addr = sock.accept()
@@ -852,11 +852,22 @@ class TeacherDeployServer:
         session_duration_ms = int(session_limit_s) * 1000
         server_ts = time.time()
         with self.lock:
-            if pc_id in self.clients:
-                session_id = self.auth_db.open_session(pc_id, user)
-                client = self.clients[pc_id]
-                existing_timer = client.session_timer
-                if existing_timer is not None and client.student_number == user["student_number"]:
+            client = self.clients.get(pc_id)
+            existing_timer = client.session_timer if client else None
+            existing_student_number = client.student_number if client else ""
+        if client is None:
+            send_json(client_sock, {"type": "auth_ack", "action": "login", "ok": False, "reason": "unknown_pc"})
+            return
+
+        session_id = self.auth_db.open_session(pc_id, user)
+
+        login_aborted = False
+        with self.lock:
+            client = self.clients.get(pc_id)
+            if client is None or client.control_sock is not client_sock:
+                login_aborted = True
+            else:
+                if existing_timer is not None and existing_student_number == user["student_number"]:
                     existing_remaining_ms = self._timer_remaining_ms(existing_timer, server_ts)
                     if existing_remaining_ms > 0:
                         session_duration_ms = min(session_duration_ms, int(existing_remaining_ms))
@@ -871,9 +882,10 @@ class TeacherDeployServer:
                 client.interrupted_remaining_s = 0
                 client.interrupted_until_ts = None
                 client.interrupted_student_number = ""
-            else:
-                send_json(client_sock, {"type": "auth_ack", "action": "login", "ok": False, "reason": "unknown_pc"})
-                return
+        if login_aborted:
+            self.auth_db.close_active_session(pc_id, status="login_aborted")
+            send_json(client_sock, {"type": "auth_ack", "action": "login", "ok": False, "reason": "unknown_pc"})
+            return
         self._send_control_json(pc_id, client_sock, {
             "type": "auth_ack",
             "action": "login",
@@ -887,14 +899,14 @@ class TeacherDeployServer:
             client = self.clients.get(pc_id)
             session_timer_payload = self._session_timer_payload(client.session_timer) if client else None
             login_ts = float(client.session_timer.start_ts) if (client and client.session_timer) else time.time()
-        self.active_sessions_by_pc_id[pc_id] = {
-            "session_id": session_id,
-            "full_name": user["full_name"],
-            "student_number": user["student_number"],
-            "year_section": user["year_section"],
-            "login_ts": login_ts,
-            "session_timer": session_timer_payload,
-        }
+            self.active_sessions_by_pc_id[pc_id] = {
+                "session_id": session_id,
+                "full_name": user["full_name"],
+                "student_number": user["student_number"],
+                "year_section": user["year_section"],
+                "login_ts": login_ts,
+                "session_timer": session_timer_payload,
+            }
         self._put_bounded(self.status_queue, pc_id)
         self._persist_session_timers()
 
@@ -1315,7 +1327,7 @@ class TeacherDeployServer:
             sock: Optional[socket.socket] = None
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.bind((NETWORK.teacher_host, NETWORK.command_fallback_port))
+                sock.bind((self.settings.teacher_bind_host, NETWORK.command_fallback_port))
                 while True:
                     data, _ = sock.recvfrom(4096)
                     try:
@@ -1340,7 +1352,7 @@ class TeacherDeployServer:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind((NETWORK.teacher_host, NETWORK.video_port))
+                sock.bind((self.settings.teacher_bind_host, NETWORK.video_port))
                 sock.listen()
                 while True:
                     client_sock, _ = sock.accept()
@@ -1506,33 +1518,395 @@ class TeacherDeployServer:
         self.broadcast_audio_stop_event.set()
 
     def start_broadcast(self, targets: list[str]) -> list[str]:
+        ordered_targets: list[str] = []
+        seen_targets: set[str] = set()
+        for raw_target in targets:
+            pc_id = str(raw_target).strip()
+            if pc_id and pc_id not in seen_targets:
+                seen_targets.add(pc_id)
+                ordered_targets.append(pc_id)
+        if not ordered_targets:
+            return []
+
+        # The UI normally invokes this method serially, but a separate gate also
+        # prevents two callers from interleaving their target rollbacks.  It is
+        # deliberately distinct from self.lock so socket I/O and joins never hold
+        # the shared server-state lock.
         with self.lock:
-            eligible = [
-                pc_id for pc_id in targets
-                if pc_id in self.clients and self.clients[pc_id].online and self.clients[pc_id].control_sock is not None
-            ]
-            self.broadcast_target_ids.update(eligible)
-        if not eligible:
+            start_gate = getattr(self, "_broadcast_start_gate", None)
+            if start_gate is None:
+                start_gate = threading.Lock()
+                self._broadcast_start_gate = start_gate
+        if not start_gate.acquire(blocking=False):
+            self._log_event("broadcast_start_aborted", reason="start_already_in_progress")
             return []
-        started: list[str] = []
-        failed: list[str] = []
-        for pc_id in eligible:
-            cmd_id = self.send_command(pc_id, "BROADCAST_START")
-            if cmd_id:
-                started.append(pc_id)
-                self._put_bounded(self.status_queue, pc_id)
-            else:
-                failed.append(pc_id)
-        if failed:
+
+        try:
+            join_deadline = time.monotonic() + 2.0
+            worker_ready_deadline = time.monotonic() + 2.5
+            registration_timeout_s = 2.0
+            poll_interval_s = 0.05
+            settle_s = 0.12
+
+            def stale_workers() -> list[tuple[str, threading.Thread]]:
+                """Return workers that cannot safely serve the current session."""
+                with self.lock:
+                    current_targets = set(self.broadcast_target_ids)
+                    video_thread = self.broadcast_thread
+                    audio_thread = self.broadcast_audio_thread
+                    video_alive = video_thread is not None and video_thread.is_alive()
+                    audio_alive = audio_thread is not None and audio_thread.is_alive()
+
+                    # A loop with no targets must be stopped before a target is
+                    # re-added.  Otherwise its finally block can poison the next
+                    # session's shared Event after the new worker has started.
+                    if not current_targets:
+                        if video_alive:
+                            self.broadcast_stop_event.set()
+                        if audio_alive:
+                            self.broadcast_audio_stop_event.set()
+
+                    video_is_stale = video_alive and self.broadcast_stop_event.is_set()
+                    audio_is_stale = audio_alive and self.broadcast_audio_stop_event.is_set()
+
+                workers: list[tuple[str, threading.Thread]] = []
+                if video_is_stale and video_thread is not None:
+                    workers.append(("video", video_thread))
+                if audio_is_stale and audio_thread is not None:
+                    workers.append(("audio", audio_thread))
+                return workers
+
+            def reap_stale_workers(stage: str) -> bool:
+                """Reap every stale worker without exceeding the shared join budget."""
+                for _attempt in range(4):
+                    workers = stale_workers()
+                    if not workers:
+                        return True
+
+                    for worker_name, _worker in workers:
+                        self._log_event(
+                            "broadcast_stale_worker_detected",
+                            worker=worker_name,
+                            stage=stage,
+                        )
+
+                    for _worker_name, worker in workers:
+                        remaining_s = max(0.0, join_deadline - time.monotonic())
+                        if remaining_s <= 0.0:
+                            break
+                        worker.join(remaining_s)
+
+                    unreaped = [worker_name for worker_name, worker in workers if worker.is_alive()]
+                    if unreaped:
+                        self._log_event(
+                            "broadcast_start_aborted",
+                            reason="stale_worker_timeout",
+                            workers=",".join(unreaped),
+                            stage=stage,
+                        )
+                        return False
+
+                    for worker_name, _worker in workers:
+                        self._log_event(
+                            "broadcast_stale_worker_reaped",
+                            worker=worker_name,
+                            stage=stage,
+                        )
+
+                self._log_event("broadcast_start_aborted", reason="stale_worker_churn", stage=stage)
+                return False
+
+            def stabilize_video(required_targets: set[str], stage: str) -> tuple[bool, str]:
+                """Ensure a live, unstopped video producer before exposing a student overlay."""
+                for attempt in range(3):
+                    if not reap_stale_workers(f"{stage}_reap"):
+                        return False, "stale_worker_timeout"
+
+                    with self.lock:
+                        active_targets = set(self.broadcast_target_ids)
+                        missing_targets = required_targets.difference(active_targets)
+                        if missing_targets:
+                            return False, "target_removed"
+                        if not active_targets:
+                            return False, "no_active_targets"
+
+                        video_thread = self.broadcast_thread
+                        audio_thread = self.broadcast_audio_thread
+                        video_dead = video_thread is None or not video_thread.is_alive()
+                        audio_dead = audio_thread is None or not audio_thread.is_alive()
+                        # Clearing is safe only after the corresponding old worker
+                        # is confirmed dead; a live worker can otherwise set it in
+                        # its finally block after this method creates a replacement.
+                        if video_dead:
+                            self.broadcast_stop_event.clear()
+                        if audio_dead:
+                            self.broadcast_audio_stop_event.clear()
+
+                    try:
+                        self._ensure_broadcast_loop()
+                        self._ensure_broadcast_audio_loop()
+                    except Exception as exc:
+                        self._log_event(
+                            "broadcast_start_aborted",
+                            reason=f"worker_start_failed:{exc}",
+                            stage=stage,
+                        )
+                        return False, "worker_start_failed"
+
+                    with self.lock:
+                        candidate = self.broadcast_thread
+                        immediately_ready = (
+                            candidate is not None
+                            and candidate.is_alive()
+                            and not self.broadcast_stop_event.is_set()
+                            and required_targets.issubset(self.broadcast_target_ids)
+                            and bool(self.broadcast_target_ids)
+                        )
+                    if immediately_ready:
+                        time.sleep(settle_s)
+                        with self.lock:
+                            stable = (
+                                self.broadcast_thread is candidate
+                                and candidate.is_alive()
+                                and not self.broadcast_stop_event.is_set()
+                                and required_targets.issubset(self.broadcast_target_ids)
+                                and bool(self.broadcast_target_ids)
+                            )
+                        if stable:
+                            return True, ""
+
+                    if time.monotonic() >= worker_ready_deadline:
+                        break
+                    self._log_event("broadcast_start_retry", stage=stage, attempt=attempt + 1)
+                    time.sleep(poll_interval_s)
+
+                self._log_event("broadcast_start_aborted", reason="video_worker_not_stable", stage=stage)
+                return False, "video_worker_not_stable"
+
+            def rollback_targets(target_ids: set[str], reason: str, stop_targets: set[str]) -> None:
+                """Undo only targets reserved by this invocation, never active peers."""
+                rollback_ids = set(target_ids)
+                if not rollback_ids:
+                    return
+                with self.lock:
+                    for pc_id in rollback_ids:
+                        self.broadcast_target_ids.discard(pc_id)
+                    no_targets_remain = not self.broadcast_target_ids
+                    if no_targets_remain:
+                        self.broadcast_stop_event.set()
+                        self.broadcast_audio_stop_event.set()
+
+                for pc_id in sorted(stop_targets.intersection(rollback_ids)):
+                    self.send_command(pc_id, "BROADCAST_STOP")
+                    self._put_bounded(self.status_queue, pc_id)
+                self._log_event(
+                    "broadcast_target_rollback",
+                    targets=",".join(sorted(rollback_ids)),
+                    reason=reason,
+                )
+
             with self.lock:
-                for pc_id in failed:
-                    self.broadcast_target_ids.discard(pc_id)
-        if not started:
-            return []
-        self._ensure_broadcast_loop()
-        self._ensure_broadcast_audio_loop()
-        self._log_event("broadcast_started", targets=",".join(sorted(started)))
-        return started
+                previous_targets = set(self.broadcast_target_ids)
+                previous_video_thread = self.broadcast_thread
+                previous_audio_thread = self.broadcast_audio_thread
+                restart_boundary = (
+                    not previous_targets
+                    and (
+                        previous_video_thread is not None
+                        or previous_audio_thread is not None
+                        or self.broadcast_stop_event.is_set()
+                        or self.broadcast_audio_stop_event.is_set()
+                    )
+                )
+
+            if not reap_stale_workers("initial"):
+                return []
+
+            # stop_broadcast() sets its Events after releasing self.lock.  Give an
+            # in-flight stop call one short chance to finish, then recheck before
+            # a new session is allowed to clear/start anything.
+            if restart_boundary:
+                time.sleep(settle_s)
+                if not reap_stale_workers("post_stop_settle"):
+                    return []
+
+            reserved_order: list[str] = []
+            registration_baselines: dict[str, int] = {}
+            for _attempt in range(3):
+                with self.lock:
+                    current_targets = set(self.broadcast_target_ids)
+                    video_thread = self.broadcast_thread
+                    audio_thread = self.broadcast_audio_thread
+                    video_stale = (
+                        video_thread is not None
+                        and video_thread.is_alive()
+                        and self.broadcast_stop_event.is_set()
+                    )
+                    audio_stale = (
+                        audio_thread is not None
+                        and audio_thread.is_alive()
+                        and self.broadcast_audio_stop_event.is_set()
+                    )
+                    if video_stale or audio_stale:
+                        needs_reap = True
+                    else:
+                        needs_reap = False
+                        eligible = [
+                            pc_id for pc_id in ordered_targets
+                            if (
+                                pc_id in self.clients
+                                and self.clients[pc_id].online
+                                and self.clients[pc_id].control_sock is not None
+                            )
+                        ]
+                        reserved_order = [pc_id for pc_id in eligible if pc_id not in current_targets]
+                        if not eligible and not current_targets:
+                            return []
+
+                        if video_thread is None or not video_thread.is_alive():
+                            self.broadcast_stop_event.clear()
+                        if audio_thread is None or not audio_thread.is_alive():
+                            self.broadcast_audio_stop_event.clear()
+                        self.broadcast_target_ids.update(reserved_order)
+                        registration_baselines = {
+                            pc_id: self.clients[pc_id].broadcast_generation
+                            for pc_id in reserved_order
+                            if pc_id in self.clients
+                        }
+                if not needs_reap:
+                    break
+                if not reap_stale_workers("reservation"):
+                    return []
+            else:
+                self._log_event("broadcast_start_aborted", reason="stale_worker_before_reservation")
+                return []
+
+            reserved_targets = set(reserved_order)
+            ready, failure_reason = stabilize_video(reserved_targets, "pre_command")
+            if not ready:
+                rollback_targets(reserved_targets, failure_reason, set())
+                return []
+
+            # Do not duplicate BROADCAST_START for targets already in a healthy
+            # session.  Revalidate newly reserved targets immediately before I/O.
+            with self.lock:
+                commandable = [
+                    pc_id for pc_id in reserved_order
+                    if (
+                        pc_id in self.broadcast_target_ids
+                        and pc_id in self.clients
+                        and self.clients[pc_id].online
+                        and self.clients[pc_id].control_sock is not None
+                    )
+                ]
+            unavailable = reserved_targets.difference(commandable)
+            if unavailable:
+                rollback_targets(unavailable, "target_no_longer_eligible", set())
+
+            sent_targets: set[str] = set()
+            command_failures: set[str] = set()
+            for pc_id in commandable:
+                cmd_id = self.send_command(pc_id, "BROADCAST_START")
+                if cmd_id:
+                    sent_targets.add(pc_id)
+                    self._put_bounded(self.status_queue, pc_id)
+                else:
+                    command_failures.add(pc_id)
+
+            if command_failures:
+                # A failed send can be ambiguous after a control reconnect, so a
+                # compensating stop is intentional: fail closed instead of leaving
+                # a student fullscreen with no verified producer.
+                rollback_targets(command_failures, "command_send_failed", command_failures)
+
+            if not sent_targets:
+                return []
+
+            pending = set(sent_targets)
+            registered: set[str] = set()
+            runtime_failures: set[str] = set()
+            registration_deadline = time.monotonic() + registration_timeout_s
+            while pending and time.monotonic() < registration_deadline:
+                with self.lock:
+                    active_targets = set(self.broadcast_target_ids)
+                    candidate = self.broadcast_thread
+                    producer_stable = (
+                        candidate is not None
+                        and candidate.is_alive()
+                        and not self.broadcast_stop_event.is_set()
+                    )
+                    missing = pending.difference(active_targets)
+                    still_pending = pending.difference(missing)
+                    newly_registered = {
+                        pc_id
+                        for pc_id in still_pending
+                        if (
+                            pc_id in self.clients
+                            and self.clients[pc_id].broadcast_sock is not None
+                            and self.clients[pc_id].broadcast_generation
+                            > registration_baselines.get(pc_id, -1)
+                        )
+                    }
+
+                if missing:
+                    runtime_failures.update(missing)
+                    pending.difference_update(missing)
+
+                if still_pending and not producer_stable:
+                    # This catches a late stop_event.set() from a prior stop or a
+                    # just-exited worker.  If the target is still active, repair
+                    # the producer without sending a duplicate start command.
+                    recovered, recovery_reason = stabilize_video(still_pending, "post_command")
+                    if not recovered:
+                        runtime_failures.update(still_pending)
+                        pending.difference_update(still_pending)
+                        self._log_event("broadcast_start_aborted", reason=recovery_reason, stage="post_command")
+                        continue
+
+                if newly_registered:
+                    registered.update(newly_registered)
+                    pending.difference_update(newly_registered)
+                if pending:
+                    time.sleep(poll_interval_s)
+
+            runtime_failures.update(pending)
+
+            # Registration alone is not enough; take one final stable snapshot so
+            # the return value means a live producer and a newly registered video
+            # downlink existed together, not merely that a command was transmitted.
+            final_ready: set[str] = set()
+            if registered:
+                final_stable, final_reason = stabilize_video(registered, "final_verify")
+                if final_stable:
+                    with self.lock:
+                        for pc_id in registered:
+                            client = self.clients.get(pc_id)
+                            if (
+                                pc_id in self.broadcast_target_ids
+                                and client is not None
+                                and client.broadcast_sock is not None
+                                and client.broadcast_generation
+                                > registration_baselines.get(pc_id, -1)
+                            ):
+                                final_ready.add(pc_id)
+                else:
+                    runtime_failures.update(registered)
+                    self._log_event("broadcast_start_aborted", reason=final_reason, stage="final_verify")
+
+            failed_targets = reserved_targets.difference(final_ready)
+            if failed_targets:
+                rollback_targets(
+                    failed_targets,
+                    "registration_or_producer_not_verified",
+                    sent_targets.difference(final_ready),
+                )
+
+            started = [pc_id for pc_id in reserved_order if pc_id in final_ready]
+            if started:
+                self._log_event("broadcast_started", targets=",".join(started), verified=True)
+            return started
+        finally:
+            start_gate.release()
 
     def stop_broadcast(self, targets: Optional[list[str]] = None) -> list[str]:
         sockets_to_close: list[socket.socket] = []
@@ -1708,7 +2082,7 @@ class TeacherDeployServer:
             sock: Optional[socket.socket] = None
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.bind((NETWORK.teacher_host, NETWORK.sensor_port))
+                sock.bind((self.settings.teacher_bind_host, NETWORK.sensor_port))
                 while True:
                     data, _ = sock.recvfrom(4096)
                     try:
@@ -3667,12 +4041,15 @@ class TeacherDeployUI:
 
         tab = ctk.CTkTabview(win, fg_color=colors["card_bg"])
         tab.pack(fill="both", expand=True, padx=12, pady=12)
+        network_tab = tab.add("Network")
         stream_tab = tab.add("Streaming")
         runtime_tab = tab.add("Runtime")
         recording_tab = tab.add("Recording")
         appearance_tab = tab.add("Appearance")
         session_tab = tab.add("Sessions")
 
+        bind_host_var = ctk.StringVar(value=st.teacher_bind_host)
+        connect_host_var = ctk.StringVar(value=st.teacher_connect_host)
         main_var = ctk.StringVar(value=st.main_stream_profile)
         prev_var = ctk.StringVar(value=st.preview_stream_profile)
         rec_var = ctk.StringVar(value=st.recording_mode)
@@ -3731,6 +4108,43 @@ class TeacherDeployUI:
             except ValueError:
                 return "Example: 5.0 means the folder is trimmed after about 5 GB."
             return f"Current value: keep total recordings under about {limit:.1f} GB."
+
+        add_tab_note(
+            network_tab,
+            "Network settings control how the Teacher/Admin server listens and what IP address students should use. Restart the admin app after changing the bind address.",
+        )
+
+        def add_text_field(parent, label: str, var: ctk.StringVar, help_text: str = "") -> ctk.CTkEntry:
+            row = ctk.CTkFrame(parent, fg_color="transparent")
+            row.pack(fill="x", padx=12, pady=(10, 2))
+            ctk.CTkLabel(row, text=label, width=200, anchor="w", text_color=colors["text_primary"]).pack(side="left")
+            entry = ctk.CTkEntry(row, textvariable=var, height=34)
+            entry.pack(side="left", fill="x", expand=True)
+            if help_text:
+                ctk.CTkLabel(
+                    parent,
+                    text=help_text,
+                    font=(self.FONT_FAMILY, 11),
+                    text_color=colors["text_secondary"],
+                    justify="left",
+                    wraplength=500,
+                ).pack(anchor="w", padx=(216, 12), pady=(0, 2))
+            return entry
+
+        bind_entry = add_text_field(
+            network_tab,
+            "Admin Bind IP",
+            bind_host_var,
+            "Use 0.0.0.0 to listen on all network adapters. Changing this requires restarting the admin app.",
+        )
+        connect_entry = add_text_field(
+            network_tab,
+            "Student Connect IP",
+            connect_host_var,
+            "This is the Teacher/Admin computer IP students should enter in their connecting overlay.",
+        )
+        network_error = ctk.CTkLabel(network_tab, text="", font=(self.FONT_FAMILY, 11), text_color=ESSU_ERROR)
+        network_error.pack(anchor="w", padx=(216, 12), pady=(0, 6))
 
         add_tab_note(
             stream_tab,
@@ -3972,6 +4386,19 @@ class TeacherDeployUI:
                 error_labels[key].configure(text="")
 
             parsed: dict[str, float] = {}
+            network_error.configure(text="")
+            bind_entry.configure(border_color=colors["border"])
+            connect_entry.configure(border_color=colors["border"])
+
+            def normalize_host(raw: str, field_name: str) -> str:
+                host = str(raw or "").strip()
+                if not host:
+                    raise ValueError(f"{field_name} is required.")
+                if any(ch.isspace() for ch in host):
+                    raise ValueError(f"{field_name} cannot contain spaces.")
+                if len(host) > 255:
+                    raise ValueError(f"{field_name} is too long.")
+                return host
 
             def parse_required_number(key: str, raw: str, caster) -> bool:
                 try:
@@ -3989,10 +4416,21 @@ class TeacherDeployUI:
             valid = parse_required_number("recording_max_gb", maxgb_var.get() or "5", float) and valid
             valid = parse_required_number("session_duration_s", sess_var.get() or "7200", int) and valid
             valid = parse_required_number("daily_limit_s", day_var.get() or "7200", int) and valid
+            try:
+                teacher_bind_host = normalize_host(bind_host_var.get(), "Admin Bind IP")
+                teacher_connect_host = normalize_host(connect_host_var.get(), "Student Connect IP")
+            except ValueError as exc:
+                bind_entry.configure(border_color=ESSU_ERROR)
+                connect_entry.configure(border_color=ESSU_ERROR)
+                network_error.configure(text=str(exc))
+                tab.set("Network")
+                return
             if not valid:
                 return
 
             settings = AppSettings(
+                teacher_bind_host=teacher_bind_host,
+                teacher_connect_host=teacher_connect_host,
                 main_stream_profile=main_var.get(),
                 preview_stream_profile=prev_var.get(),
                 recording_mode=rec_var.get(),
@@ -4288,7 +4726,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
 
 
