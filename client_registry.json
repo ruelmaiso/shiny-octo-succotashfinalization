@@ -9,7 +9,12 @@
       "mac": "d0:c5:d3:a9:23:c2",
       "hostname": "DESKTOP-S37OIV1",
       "pc_id": "PC02"
+    },
+    {
+      "mac": "bc:dd:21:19:7d:64",
+      "hostname": "matilde",
+      "pc_id": "PC03"
     }
   ],
-  "next_id": 3
+  "next_id": 4
 }

@@ -19,10 +19,6 @@ import cv2
 import customtkinter as ctk
 import mss
 import numpy
-try:
-    import sounddevice as sd
-except Exception:
-    sd = None
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +30,7 @@ from core.auth_db import AuthDatabase
 from core.client_registry import ClientRegistry
 from core.heartbeat import HeartbeatState
 from core.protocol import recv_frame, recv_json_line, send_frame, send_json
+from core.screen_share import ScreenShareBroadcaster
 from core.app_settings import AppSettings, SettingsStore
 from teacher.reservations import ReservationManager
 from teacher.ui.student_management import StudentManagementPanel
@@ -54,12 +51,6 @@ from teacher.theme import (
     DARK_TEXT_SECONDARY,
 )
 
-AUDIO_SAMPLE_RATE = 16000
-AUDIO_CHANNELS = 1
-AUDIO_DTYPE = "int16"
-AUDIO_BLOCK_MS = 40
-AUDIO_BLOCK_SIZE = max(1, int(AUDIO_SAMPLE_RATE * AUDIO_BLOCK_MS / 1000))
-
 
 @dataclass
 class ClientState:
@@ -69,8 +60,6 @@ class ClientState:
     control_sock: Optional[socket.socket] = None
     control_send_lock: threading.Lock = field(default_factory=threading.Lock)
     video_sock: Optional[socket.socket] = None
-    broadcast_sock: Optional[socket.socket] = None
-    broadcast_audio_sock: Optional[socket.socket] = None
     last_frame: Optional[Image.Image] = None
     heartbeat: HeartbeatState = field(default_factory=HeartbeatState)
     online: bool = False
@@ -93,8 +82,6 @@ class ClientState:
     interrupted_student_number: str = ""
     control_generation: int = 0
     video_generation: int = 0
-    broadcast_generation: int = 0
-    broadcast_audio_generation: int = 0
     heartbeat_generation: int = 0
     lock_intent: bool = False
     lock_reason: Optional[str] = None
@@ -176,7 +163,7 @@ STATUS_COLORS = THEME_STATUS_COLORS
 CONVERSATION_TTL_S = 6 * 60 * 60
 CONVERSATION_MAX_PCS = 500
 
-VALID_COMMAND_ACKS = {"LOCK_NOW", "UNLOCK_NOW", "SET_TIMER", "EXTEND_TIMER", "CANCEL_TIMER", "TIMER_EXPIRED", "TIMER_WARNING", "SET_STREAM_PROFILE", "SET_RUNTIME_TUNING", "SESSION_MESSAGE", "EXTENSION_REQUEST", "EXTENSION_OFFER", "PAUSE_TIMER", "RESUME_TIMER", "BROADCAST_START", "BROADCAST_STOP", "SHUTDOWN", "RESTART"}
+VALID_COMMAND_ACKS = {"LOCK_NOW", "UNLOCK_NOW", "SET_TIMER", "EXTEND_TIMER", "CANCEL_TIMER", "TIMER_EXPIRED", "TIMER_WARNING", "SET_STREAM_PROFILE", "SET_RUNTIME_TUNING", "SESSION_MESSAGE", "EXTENSION_REQUEST", "EXTENSION_OFFER", "PAUSE_TIMER", "RESUME_TIMER", "SHUTDOWN", "RESTART", "SCREEN_SHARE_START", "SCREEN_SHARE_STOP"}
 ERROR_CODES = {
     "CONTROL_VALIDATION_ERROR",
     "SENSOR_VALIDATION_ERROR",
@@ -229,13 +216,18 @@ class TeacherDeployServer:
         self.extension_status_by_pc: dict[str, str] = {}
         self.session_extension_ms_by_timer_pc: dict[tuple[str, str], int] = {}
         self.video_status_last_ts_by_pc: dict[str, float] = {}
+        # Only timers paused by this screen-share session are resumed on stop.
+        # This preserves an independently paused session's state.
+        self.screen_share_paused_session_pc_ids: set[str] = set()
         self.udp_send_sock: Optional[socket.socket] = None
         self.udp_send_lock = threading.Lock()
-        self.broadcast_target_ids: set[str] = set()
-        self.broadcast_thread: Optional[threading.Thread] = None
-        self.broadcast_stop_event = threading.Event()
-        self.broadcast_audio_thread: Optional[threading.Thread] = None
-        self.broadcast_audio_stop_event = threading.Event()
+        self.screen_share = ScreenShareBroadcaster(
+            self.settings.teacher_bind_host, NETWORK.screen_share_video_port, NETWORK.screen_share_audio_port,
+            width=RUNTIME.screen_share_width, height=RUNTIME.screen_share_height,
+            fps=RUNTIME.screen_share_fps, jpeg_quality=RUNTIME.screen_share_jpeg_quality,
+            audio_rate=RUNTIME.screen_share_audio_rate, audio_channels=RUNTIME.screen_share_audio_channels,
+            audio_chunk_frames=RUNTIME.screen_share_audio_chunk_frames, log=self._log_event,
+        )
         self.timers_file = ROOT / "data" / "active_timers.json"
         self.session_timers_file = ROOT / "data" / "active_session_timers.json"
         self.auth_db.close_all_active_recordings(status="server_restart")
@@ -586,6 +578,7 @@ class TeacherDeployServer:
             time.sleep(5)
 
     def start(self) -> None:
+        self.screen_share.start_services()
         threading.Thread(target=self._run_control_server, daemon=True).start()
         threading.Thread(target=self._run_video_server, daemon=True).start()
         threading.Thread(target=self._run_sensor_server, daemon=True).start()
@@ -621,8 +614,6 @@ class TeacherDeployServer:
         pc_id: Optional[str] = None
         owned_generation = 0
         file_obj = None
-        broadcast_sock_to_close: Optional[socket.socket] = None
-        broadcast_audio_sock_to_close: Optional[socket.socket] = None
         try:
             file_obj = client_sock.makefile("rb")
             while True:
@@ -699,6 +690,9 @@ class TeacherDeployServer:
                         "max_fps": RUNTIME.max_fps,
                     })
                     self.send_command(assigned, "SET_RUNTIME_TUNING", {"reconnect_interval_s": int(self.settings.reconnect_interval_s)})
+                    active_screen_share = self.screen_share.active_session_id
+                    if active_screen_share:
+                        self._send_screen_share_start(assigned, active_screen_share)
                     if assigned in self.pending_signout_lock_pc_ids:
                         with self.lock:
                             client_ref = self.clients.get(assigned)
@@ -762,13 +756,6 @@ class TeacherDeployServer:
                         if client is not None:
                             client.control_sock = None
                             client.online = False
-                            if client.broadcast_sock is not None:
-                                broadcast_sock_to_close = client.broadcast_sock
-                                client.broadcast_sock = None
-                            if client.broadcast_audio_sock is not None:
-                                broadcast_audio_sock_to_close = client.broadcast_audio_sock
-                                client.broadcast_audio_sock = None
-                            self.broadcast_target_ids.discard(pc_id)
                         if client is not None:
                             now_ts = time.time()
                             if client.current_user:
@@ -787,16 +774,6 @@ class TeacherDeployServer:
                     self._stop_recording(pc_id, status="disconnected")
                 self._put_bounded(self.status_queue, pc_id)
                 self._log_event("control_disconnected", pc_id=pc_id)
-            if broadcast_sock_to_close is not None:
-                try:
-                    broadcast_sock_to_close.close()
-                except OSError:
-                    pass
-            if broadcast_audio_sock_to_close is not None:
-                try:
-                    broadcast_audio_sock_to_close.close()
-                except OSError:
-                    pass
             client_sock.close()
 
     def _valid_student_number(self, value: str) -> bool:
@@ -1388,558 +1365,6 @@ class TeacherDeployServer:
                 self.udp_send_sock = None
                 return False
 
-    def _broadcast_profile(self) -> tuple[int, int, int]:
-        profile_map = {"360p": (640, 360, 60), "720p": (1280, 720, 80), "1080p": (1920, 1080, 90)}
-        return profile_map.get(self.settings.main_stream_profile, profile_map["720p"])
-
-    def _ensure_broadcast_loop(self) -> None:
-        if self.broadcast_thread is not None and self.broadcast_thread.is_alive():
-            return
-        self.broadcast_stop_event.clear()
-        self.broadcast_thread = threading.Thread(target=self._run_broadcast_loop, daemon=True)
-        self.broadcast_thread.start()
-
-    def _ensure_broadcast_audio_loop(self) -> None:
-        if self.broadcast_audio_thread is not None and self.broadcast_audio_thread.is_alive():
-            return
-        self.broadcast_audio_stop_event.clear()
-        self.broadcast_audio_thread = threading.Thread(target=self._run_broadcast_audio_loop, daemon=True)
-        self.broadcast_audio_thread.start()
-
-    def _run_broadcast_loop(self) -> None:
-        try:
-            with mss.mss() as sct:
-                monitor = sct.monitors[1]
-                while not self.broadcast_stop_event.is_set():
-                    with self.lock:
-                        target_ids = list(self.broadcast_target_ids)
-                    if not target_ids:
-                        break
-
-                    width, height, jpeg_quality = self._broadcast_profile()
-                    shot = sct.grab(monitor)
-                    frame = cv2.cvtColor(numpy.array(shot), cv2.COLOR_BGRA2BGR)
-                    if frame.shape[1] != width or frame.shape[0] != height:
-                        frame = cv2.resize(frame, (width, height))
-                    ok, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
-                    if not ok:
-                        time.sleep(0.2)
-                        continue
-
-                    frame_bytes = jpeg.tobytes()
-                    recipients: list[tuple[str, socket.socket]] = []
-                    with self.lock:
-                        for pc_id in target_ids:
-                            client = self.clients.get(pc_id)
-                            if not client or not client.online or client.broadcast_sock is None:
-                                continue
-                            recipients.append((pc_id, client.broadcast_sock))
-
-                    failed_ids: list[str] = []
-                    failed_socks: list[socket.socket] = []
-                    for pc_id, client_sock in recipients:
-                        try:
-                            send_frame(client_sock, frame_bytes)
-                        except OSError:
-                            failed_ids.append(pc_id)
-                            failed_socks.append(client_sock)
-
-                    if failed_ids:
-                        with self.lock:
-                            for pc_id, failed_sock in zip(failed_ids, failed_socks):
-                                client = self.clients.get(pc_id)
-                                if client and client.broadcast_sock is failed_sock:
-                                    client.broadcast_sock = None
-                                self.broadcast_target_ids.discard(pc_id)
-                                self._put_bounded(self.status_queue, pc_id)
-                        for failed_sock in failed_socks:
-                            try:
-                                failed_sock.close()
-                            except OSError:
-                                pass
-
-                    time.sleep(1 / max(1, RUNTIME.max_fps))
-        except Exception as exc:
-            self._log_event("broadcast_loop_error", reason=str(exc))
-        finally:
-            self.broadcast_stop_event.set()
-
-    def _run_broadcast_audio_loop(self) -> None:
-        if sd is None:
-            self._log_event("broadcast_audio_unavailable", reason="sounddevice_not_installed")
-            return
-        while not self.broadcast_audio_stop_event.is_set():
-            with self.lock:
-                target_ids = list(self.broadcast_target_ids)
-            if not target_ids:
-                break
-            try:
-                with sd.InputStream(
-                    samplerate=AUDIO_SAMPLE_RATE,
-                    channels=AUDIO_CHANNELS,
-                    dtype=AUDIO_DTYPE,
-                    blocksize=AUDIO_BLOCK_SIZE,
-                ) as stream:
-                    while not self.broadcast_audio_stop_event.is_set():
-                        with self.lock:
-                            target_ids = list(self.broadcast_target_ids)
-                        if not target_ids:
-                            return
-                        audio_chunk, _overflowed = stream.read(AUDIO_BLOCK_SIZE)
-                        audio_bytes = numpy.asarray(audio_chunk, dtype=numpy.int16).tobytes()
-                        recipients: list[tuple[str, socket.socket]] = []
-                        with self.lock:
-                            for pc_id in target_ids:
-                                client = self.clients.get(pc_id)
-                                if not client or not client.online or client.broadcast_audio_sock is None:
-                                    continue
-                                recipients.append((pc_id, client.broadcast_audio_sock))
-
-                        failed_socks: list[socket.socket] = []
-                        for pc_id, client_sock in recipients:
-                            try:
-                                send_frame(client_sock, audio_bytes)
-                            except OSError:
-                                failed_socks.append(client_sock)
-                                with self.lock:
-                                    client = self.clients.get(pc_id)
-                                    if client and client.broadcast_audio_sock is client_sock:
-                                        client.broadcast_audio_sock = None
-                                        self._put_bounded(self.status_queue, pc_id)
-                        for failed_sock in failed_socks:
-                            try:
-                                failed_sock.close()
-                            except OSError:
-                                pass
-            except Exception as exc:
-                self._log_event("broadcast_audio_error", reason=str(exc))
-                if self.broadcast_audio_stop_event.wait(1.0):
-                    break
-        self.broadcast_audio_stop_event.set()
-
-    def start_broadcast(self, targets: list[str]) -> list[str]:
-        ordered_targets: list[str] = []
-        seen_targets: set[str] = set()
-        for raw_target in targets:
-            pc_id = str(raw_target).strip()
-            if pc_id and pc_id not in seen_targets:
-                seen_targets.add(pc_id)
-                ordered_targets.append(pc_id)
-        if not ordered_targets:
-            return []
-
-        # The UI normally invokes this method serially, but a separate gate also
-        # prevents two callers from interleaving their target rollbacks.  It is
-        # deliberately distinct from self.lock so socket I/O and joins never hold
-        # the shared server-state lock.
-        with self.lock:
-            start_gate = getattr(self, "_broadcast_start_gate", None)
-            if start_gate is None:
-                start_gate = threading.Lock()
-                self._broadcast_start_gate = start_gate
-        if not start_gate.acquire(blocking=False):
-            self._log_event("broadcast_start_aborted", reason="start_already_in_progress")
-            return []
-
-        try:
-            join_deadline = time.monotonic() + 2.0
-            worker_ready_deadline = time.monotonic() + 2.5
-            registration_timeout_s = 2.0
-            poll_interval_s = 0.05
-            settle_s = 0.12
-
-            def stale_workers() -> list[tuple[str, threading.Thread]]:
-                """Return workers that cannot safely serve the current session."""
-                with self.lock:
-                    current_targets = set(self.broadcast_target_ids)
-                    video_thread = self.broadcast_thread
-                    audio_thread = self.broadcast_audio_thread
-                    video_alive = video_thread is not None and video_thread.is_alive()
-                    audio_alive = audio_thread is not None and audio_thread.is_alive()
-
-                    # A loop with no targets must be stopped before a target is
-                    # re-added.  Otherwise its finally block can poison the next
-                    # session's shared Event after the new worker has started.
-                    if not current_targets:
-                        if video_alive:
-                            self.broadcast_stop_event.set()
-                        if audio_alive:
-                            self.broadcast_audio_stop_event.set()
-
-                    video_is_stale = video_alive and self.broadcast_stop_event.is_set()
-                    audio_is_stale = audio_alive and self.broadcast_audio_stop_event.is_set()
-
-                workers: list[tuple[str, threading.Thread]] = []
-                if video_is_stale and video_thread is not None:
-                    workers.append(("video", video_thread))
-                if audio_is_stale and audio_thread is not None:
-                    workers.append(("audio", audio_thread))
-                return workers
-
-            def reap_stale_workers(stage: str) -> bool:
-                """Reap every stale worker without exceeding the shared join budget."""
-                for _attempt in range(4):
-                    workers = stale_workers()
-                    if not workers:
-                        return True
-
-                    for worker_name, _worker in workers:
-                        self._log_event(
-                            "broadcast_stale_worker_detected",
-                            worker=worker_name,
-                            stage=stage,
-                        )
-
-                    for _worker_name, worker in workers:
-                        remaining_s = max(0.0, join_deadline - time.monotonic())
-                        if remaining_s <= 0.0:
-                            break
-                        worker.join(remaining_s)
-
-                    unreaped = [worker_name for worker_name, worker in workers if worker.is_alive()]
-                    if unreaped:
-                        self._log_event(
-                            "broadcast_start_aborted",
-                            reason="stale_worker_timeout",
-                            workers=",".join(unreaped),
-                            stage=stage,
-                        )
-                        return False
-
-                    for worker_name, _worker in workers:
-                        self._log_event(
-                            "broadcast_stale_worker_reaped",
-                            worker=worker_name,
-                            stage=stage,
-                        )
-
-                self._log_event("broadcast_start_aborted", reason="stale_worker_churn", stage=stage)
-                return False
-
-            def stabilize_video(required_targets: set[str], stage: str) -> tuple[bool, str]:
-                """Ensure a live, unstopped video producer before exposing a student overlay."""
-                for attempt in range(3):
-                    if not reap_stale_workers(f"{stage}_reap"):
-                        return False, "stale_worker_timeout"
-
-                    with self.lock:
-                        active_targets = set(self.broadcast_target_ids)
-                        missing_targets = required_targets.difference(active_targets)
-                        if missing_targets:
-                            return False, "target_removed"
-                        if not active_targets:
-                            return False, "no_active_targets"
-
-                        video_thread = self.broadcast_thread
-                        audio_thread = self.broadcast_audio_thread
-                        video_dead = video_thread is None or not video_thread.is_alive()
-                        audio_dead = audio_thread is None or not audio_thread.is_alive()
-                        # Clearing is safe only after the corresponding old worker
-                        # is confirmed dead; a live worker can otherwise set it in
-                        # its finally block after this method creates a replacement.
-                        if video_dead:
-                            self.broadcast_stop_event.clear()
-                        if audio_dead:
-                            self.broadcast_audio_stop_event.clear()
-
-                    try:
-                        self._ensure_broadcast_loop()
-                        self._ensure_broadcast_audio_loop()
-                    except Exception as exc:
-                        self._log_event(
-                            "broadcast_start_aborted",
-                            reason=f"worker_start_failed:{exc}",
-                            stage=stage,
-                        )
-                        return False, "worker_start_failed"
-
-                    with self.lock:
-                        candidate = self.broadcast_thread
-                        immediately_ready = (
-                            candidate is not None
-                            and candidate.is_alive()
-                            and not self.broadcast_stop_event.is_set()
-                            and required_targets.issubset(self.broadcast_target_ids)
-                            and bool(self.broadcast_target_ids)
-                        )
-                    if immediately_ready:
-                        time.sleep(settle_s)
-                        with self.lock:
-                            stable = (
-                                self.broadcast_thread is candidate
-                                and candidate.is_alive()
-                                and not self.broadcast_stop_event.is_set()
-                                and required_targets.issubset(self.broadcast_target_ids)
-                                and bool(self.broadcast_target_ids)
-                            )
-                        if stable:
-                            return True, ""
-
-                    if time.monotonic() >= worker_ready_deadline:
-                        break
-                    self._log_event("broadcast_start_retry", stage=stage, attempt=attempt + 1)
-                    time.sleep(poll_interval_s)
-
-                self._log_event("broadcast_start_aborted", reason="video_worker_not_stable", stage=stage)
-                return False, "video_worker_not_stable"
-
-            def rollback_targets(target_ids: set[str], reason: str, stop_targets: set[str]) -> None:
-                """Undo only targets reserved by this invocation, never active peers."""
-                rollback_ids = set(target_ids)
-                if not rollback_ids:
-                    return
-                with self.lock:
-                    for pc_id in rollback_ids:
-                        self.broadcast_target_ids.discard(pc_id)
-                    no_targets_remain = not self.broadcast_target_ids
-                    if no_targets_remain:
-                        self.broadcast_stop_event.set()
-                        self.broadcast_audio_stop_event.set()
-
-                for pc_id in sorted(stop_targets.intersection(rollback_ids)):
-                    self.send_command(pc_id, "BROADCAST_STOP")
-                    self._put_bounded(self.status_queue, pc_id)
-                self._log_event(
-                    "broadcast_target_rollback",
-                    targets=",".join(sorted(rollback_ids)),
-                    reason=reason,
-                )
-
-            with self.lock:
-                previous_targets = set(self.broadcast_target_ids)
-                previous_video_thread = self.broadcast_thread
-                previous_audio_thread = self.broadcast_audio_thread
-                restart_boundary = (
-                    not previous_targets
-                    and (
-                        previous_video_thread is not None
-                        or previous_audio_thread is not None
-                        or self.broadcast_stop_event.is_set()
-                        or self.broadcast_audio_stop_event.is_set()
-                    )
-                )
-
-            if not reap_stale_workers("initial"):
-                return []
-
-            # stop_broadcast() sets its Events after releasing self.lock.  Give an
-            # in-flight stop call one short chance to finish, then recheck before
-            # a new session is allowed to clear/start anything.
-            if restart_boundary:
-                time.sleep(settle_s)
-                if not reap_stale_workers("post_stop_settle"):
-                    return []
-
-            reserved_order: list[str] = []
-            registration_baselines: dict[str, int] = {}
-            for _attempt in range(3):
-                with self.lock:
-                    current_targets = set(self.broadcast_target_ids)
-                    video_thread = self.broadcast_thread
-                    audio_thread = self.broadcast_audio_thread
-                    video_stale = (
-                        video_thread is not None
-                        and video_thread.is_alive()
-                        and self.broadcast_stop_event.is_set()
-                    )
-                    audio_stale = (
-                        audio_thread is not None
-                        and audio_thread.is_alive()
-                        and self.broadcast_audio_stop_event.is_set()
-                    )
-                    if video_stale or audio_stale:
-                        needs_reap = True
-                    else:
-                        needs_reap = False
-                        eligible = [
-                            pc_id for pc_id in ordered_targets
-                            if (
-                                pc_id in self.clients
-                                and self.clients[pc_id].online
-                                and self.clients[pc_id].control_sock is not None
-                            )
-                        ]
-                        reserved_order = [pc_id for pc_id in eligible if pc_id not in current_targets]
-                        if not eligible and not current_targets:
-                            return []
-
-                        if video_thread is None or not video_thread.is_alive():
-                            self.broadcast_stop_event.clear()
-                        if audio_thread is None or not audio_thread.is_alive():
-                            self.broadcast_audio_stop_event.clear()
-                        self.broadcast_target_ids.update(reserved_order)
-                        registration_baselines = {
-                            pc_id: self.clients[pc_id].broadcast_generation
-                            for pc_id in reserved_order
-                            if pc_id in self.clients
-                        }
-                if not needs_reap:
-                    break
-                if not reap_stale_workers("reservation"):
-                    return []
-            else:
-                self._log_event("broadcast_start_aborted", reason="stale_worker_before_reservation")
-                return []
-
-            reserved_targets = set(reserved_order)
-            ready, failure_reason = stabilize_video(reserved_targets, "pre_command")
-            if not ready:
-                rollback_targets(reserved_targets, failure_reason, set())
-                return []
-
-            # Do not duplicate BROADCAST_START for targets already in a healthy
-            # session.  Revalidate newly reserved targets immediately before I/O.
-            with self.lock:
-                commandable = [
-                    pc_id for pc_id in reserved_order
-                    if (
-                        pc_id in self.broadcast_target_ids
-                        and pc_id in self.clients
-                        and self.clients[pc_id].online
-                        and self.clients[pc_id].control_sock is not None
-                    )
-                ]
-            unavailable = reserved_targets.difference(commandable)
-            if unavailable:
-                rollback_targets(unavailable, "target_no_longer_eligible", set())
-
-            sent_targets: set[str] = set()
-            command_failures: set[str] = set()
-            for pc_id in commandable:
-                cmd_id = self.send_command(pc_id, "BROADCAST_START")
-                if cmd_id:
-                    sent_targets.add(pc_id)
-                    self._put_bounded(self.status_queue, pc_id)
-                else:
-                    command_failures.add(pc_id)
-
-            if command_failures:
-                # A failed send can be ambiguous after a control reconnect, so a
-                # compensating stop is intentional: fail closed instead of leaving
-                # a student fullscreen with no verified producer.
-                rollback_targets(command_failures, "command_send_failed", command_failures)
-
-            if not sent_targets:
-                return []
-
-            pending = set(sent_targets)
-            registered: set[str] = set()
-            runtime_failures: set[str] = set()
-            registration_deadline = time.monotonic() + registration_timeout_s
-            while pending and time.monotonic() < registration_deadline:
-                with self.lock:
-                    active_targets = set(self.broadcast_target_ids)
-                    candidate = self.broadcast_thread
-                    producer_stable = (
-                        candidate is not None
-                        and candidate.is_alive()
-                        and not self.broadcast_stop_event.is_set()
-                    )
-                    missing = pending.difference(active_targets)
-                    still_pending = pending.difference(missing)
-                    newly_registered = {
-                        pc_id
-                        for pc_id in still_pending
-                        if (
-                            pc_id in self.clients
-                            and self.clients[pc_id].broadcast_sock is not None
-                            and self.clients[pc_id].broadcast_generation
-                            > registration_baselines.get(pc_id, -1)
-                        )
-                    }
-
-                if missing:
-                    runtime_failures.update(missing)
-                    pending.difference_update(missing)
-
-                if still_pending and not producer_stable:
-                    # This catches a late stop_event.set() from a prior stop or a
-                    # just-exited worker.  If the target is still active, repair
-                    # the producer without sending a duplicate start command.
-                    recovered, recovery_reason = stabilize_video(still_pending, "post_command")
-                    if not recovered:
-                        runtime_failures.update(still_pending)
-                        pending.difference_update(still_pending)
-                        self._log_event("broadcast_start_aborted", reason=recovery_reason, stage="post_command")
-                        continue
-
-                if newly_registered:
-                    registered.update(newly_registered)
-                    pending.difference_update(newly_registered)
-                if pending:
-                    time.sleep(poll_interval_s)
-
-            runtime_failures.update(pending)
-
-            # Registration alone is not enough; take one final stable snapshot so
-            # the return value means a live producer and a newly registered video
-            # downlink existed together, not merely that a command was transmitted.
-            final_ready: set[str] = set()
-            if registered:
-                final_stable, final_reason = stabilize_video(registered, "final_verify")
-                if final_stable:
-                    with self.lock:
-                        for pc_id in registered:
-                            client = self.clients.get(pc_id)
-                            if (
-                                pc_id in self.broadcast_target_ids
-                                and client is not None
-                                and client.broadcast_sock is not None
-                                and client.broadcast_generation
-                                > registration_baselines.get(pc_id, -1)
-                            ):
-                                final_ready.add(pc_id)
-                else:
-                    runtime_failures.update(registered)
-                    self._log_event("broadcast_start_aborted", reason=final_reason, stage="final_verify")
-
-            failed_targets = reserved_targets.difference(final_ready)
-            if failed_targets:
-                rollback_targets(
-                    failed_targets,
-                    "registration_or_producer_not_verified",
-                    sent_targets.difference(final_ready),
-                )
-
-            started = [pc_id for pc_id in reserved_order if pc_id in final_ready]
-            if started:
-                self._log_event("broadcast_started", targets=",".join(started), verified=True)
-            return started
-        finally:
-            start_gate.release()
-
-    def stop_broadcast(self, targets: Optional[list[str]] = None) -> list[str]:
-        sockets_to_close: list[socket.socket] = []
-        with self.lock:
-            current = set(self.broadcast_target_ids)
-            if targets is None:
-                target_set = current
-            else:
-                target_set = current.intersection(targets)
-            for pc_id in target_set:
-                client = self.clients.get(pc_id)
-                if client and client.broadcast_sock is not None:
-                    sockets_to_close.append(client.broadcast_sock)
-                    client.broadcast_sock = None
-                if client and client.broadcast_audio_sock is not None:
-                    sockets_to_close.append(client.broadcast_audio_sock)
-                    client.broadcast_audio_sock = None
-                self.broadcast_target_ids.discard(pc_id)
-        if not self.broadcast_target_ids:
-            self.broadcast_stop_event.set()
-            self.broadcast_audio_stop_event.set()
-        for client_sock in sockets_to_close:
-            try:
-                client_sock.close()
-            except OSError:
-                pass
-        for pc_id in sorted(target_set):
-            self.send_command(pc_id, "BROADCAST_STOP")
-            self._put_bounded(self.status_queue, pc_id)
-        if target_set:
-            self._log_event("broadcast_stopped", targets=",".join(sorted(target_set)))
-        return sorted(target_set)
-
     def _video_client_loop(self, client_sock: socket.socket) -> None:
         pc_id: Optional[str] = None
         file_obj = None
@@ -1951,66 +1376,22 @@ class TeacherDeployServer:
                 return
             pc_id = str(reg.get("pc_id", ""))
             role = str(reg.get("role", "uplink")).strip().lower() or "uplink"
+            if role != "uplink":
+                return
+            registration_diag: dict[str, object] = {"pc_id": pc_id, "role": role, "accepted_socket_id": id(client_sock)}
             with self.lock:
                 if pc_id not in self.clients:
+                    self._log_event("video_registration_unknown_client", pc_id=pc_id)
                     return
                 client = self.clients[pc_id]
-                if role == "broadcast_downlink":
-                    if client.broadcast_sock and client.broadcast_sock is not client_sock:
-                        try:
-                            client.broadcast_sock.close()
-                        except OSError:
-                            pass
-                    client.broadcast_generation += 1
-                    owned_video_generation = client.broadcast_generation
-                    client.broadcast_sock = client_sock
-                elif role == "broadcast_audio_downlink":
-                    if client.broadcast_audio_sock and client.broadcast_audio_sock is not client_sock:
-                        try:
-                            client.broadcast_audio_sock.close()
-                        except OSError:
-                            pass
-                    client.broadcast_audio_generation += 1
-                    owned_video_generation = client.broadcast_audio_generation
-                    client.broadcast_audio_sock = client_sock
-                else:
-                    if client.video_sock and client.video_sock is not client_sock:
-                        try:
-                            client.video_sock.close()
-                        except OSError:
-                            pass
-                    client.video_generation += 1
-                    owned_video_generation = client.video_generation
-                    client.video_sock = client_sock
-            if role == "broadcast_downlink":
-                self._log_event("broadcast_video_registered", pc_id=pc_id)
-                while True:
-                    with self.lock:
-                        client = self.clients.get(pc_id or "")
-                        if (
-                            not client
-                            or client.broadcast_generation != owned_video_generation
-                            or client.broadcast_sock is not client_sock
-                            or pc_id not in self.broadcast_target_ids
-                        ):
-                            break
-                    time.sleep(0.5)
-                return
-            if role == "broadcast_audio_downlink":
-                self._log_event("broadcast_audio_registered", pc_id=pc_id)
-                while True:
-                    with self.lock:
-                        client = self.clients.get(pc_id or "")
-                        if (
-                            not client
-                            or client.broadcast_audio_generation != owned_video_generation
-                            or client.broadcast_audio_sock is not client_sock
-                            or pc_id not in self.broadcast_target_ids
-                        ):
-                            break
-                    time.sleep(0.5)
-                return
-
+                if client.video_sock and client.video_sock is not client_sock:
+                    try:
+                        client.video_sock.close()
+                    except OSError:
+                        pass
+                client.video_generation += 1
+                owned_video_generation = client.video_generation
+                client.video_sock = client_sock
             self._log_event("video_registered", pc_id=pc_id)
             while True:
                 with self.lock:
@@ -2056,25 +1437,11 @@ class TeacherDeployServer:
                     pass
             if pc_id:
                 with self.lock:
-                    if pc_id in self.clients:
-                        if role == "broadcast_downlink":
-                            if self.clients[pc_id].broadcast_sock is client_sock:
-                                self.clients[pc_id].broadcast_sock = None
-                        elif role == "broadcast_audio_downlink":
-                            if self.clients[pc_id].broadcast_audio_sock is client_sock:
-                                self.clients[pc_id].broadcast_audio_sock = None
-                        else:
-                            if self.clients[pc_id].video_sock is client_sock:
-                                self.clients[pc_id].video_sock = None
-                    if role not in {"broadcast_downlink", "broadcast_audio_downlink"}:
-                        self.video_status_last_ts_by_pc.pop(pc_id, None)
+                    if pc_id in self.clients and self.clients[pc_id].video_sock is client_sock:
+                        self.clients[pc_id].video_sock = None
+                    self.video_status_last_ts_by_pc.pop(pc_id, None)
                 self._put_bounded(self.status_queue, pc_id)
-                if role == "broadcast_downlink":
-                    self._log_event("broadcast_video_disconnected", pc_id=pc_id)
-                elif role == "broadcast_audio_downlink":
-                    self._log_event("broadcast_audio_disconnected", pc_id=pc_id)
-                else:
-                    self._log_event("video_disconnected", pc_id=pc_id)
+                self._log_event("video_disconnected", pc_id=pc_id)
             client_sock.close()
 
     def _run_sensor_server(self) -> None:
@@ -2315,7 +1682,7 @@ class TeacherDeployServer:
             })
 
     def send_command(self, pc_id: str, command: str, payload: Optional[dict] = None, *, allow_udp_fallback: bool = True) -> Optional[str]:
-        if command in {"SHUTDOWN", "RESTART"}:
+        if command in {"SHUTDOWN", "RESTART", "SCREEN_SHARE_START", "SCREEN_SHARE_STOP"}:
             allow_udp_fallback = False
         with self.lock:
             client = self.clients.get(pc_id)
@@ -2350,6 +1717,67 @@ class TeacherDeployServer:
             except OSError:
                 return None
         return None
+
+    def _send_screen_share_start(self, pc_id: str, session_id: str) -> Optional[str]:
+        return self.send_command(pc_id, "SCREEN_SHARE_START", {
+            "session_id": session_id,
+            "video_port": NETWORK.screen_share_video_port,
+            "audio_port": NETWORK.screen_share_audio_port,
+            "width": RUNTIME.screen_share_width,
+            "height": RUNTIME.screen_share_height,
+            "fps": RUNTIME.screen_share_fps,
+            "audio_rate": RUNTIME.screen_share_audio_rate,
+            "audio_channels": RUNTIME.screen_share_audio_channels,
+            "audio_chunk_frames": RUNTIME.screen_share_audio_chunk_frames,
+        })
+
+    def start_screen_share(self) -> tuple[str, int]:
+        self._log_event("SCREEN_SHARE_START_REQUESTED")
+        with self.lock:
+            targets = [pc_id for pc_id, client in self.clients.items() if client.online and client.control_sock]
+        if not targets:
+            self._log_event("SCREEN_SHARE_START_REJECTED", reason="no_eligible_students")
+            return "", 0
+        session_id = self.screen_share.start_session()
+        pause_ts = time.time()
+        with self.lock:
+            self.screen_share_paused_session_pc_ids.clear()
+            for pc_id in targets:
+                client = self.clients.get(pc_id)
+                if client and client.current_user and client.session_timer and not client.session_timer.paused:
+                    client.session_timer.paused = True
+                    client.session_timer.paused_at_ts = pause_ts
+                    self.screen_share_paused_session_pc_ids.add(pc_id)
+                    if pc_id in self.active_sessions_by_pc_id:
+                        self.active_sessions_by_pc_id[pc_id]["session_timer"] = self._session_timer_payload(client.session_timer)
+        for pc_id in targets:
+            self._send_screen_share_start(pc_id, session_id)
+        self._persist_session_timers()
+        return session_id, len(targets)
+
+    def stop_screen_share(self) -> None:
+        self._log_event("SCREEN_SHARE_STOP_REQUESTED")
+        session_id = self.screen_share.active_session_id
+        self.screen_share.stop_session()
+        with self.lock:
+            targets = [pc_id for pc_id, client in self.clients.items() if client.online and client.control_sock]
+        for pc_id in targets:
+            self.send_command(pc_id, "SCREEN_SHARE_STOP", {"session_id": session_id})
+        resume_ts = time.time()
+        with self.lock:
+            paused_by_share = set(self.screen_share_paused_session_pc_ids)
+            self.screen_share_paused_session_pc_ids.clear()
+            for pc_id in paused_by_share:
+                client = self.clients.get(pc_id)
+                if not client or not client.session_timer or not client.session_timer.paused:
+                    continue
+                if client.session_timer.paused_at_ts is not None:
+                    client.session_timer.paused_accum_ms += max(0, int((resume_ts - client.session_timer.paused_at_ts) * 1000))
+                client.session_timer.paused = False
+                client.session_timer.paused_at_ts = None
+                if pc_id in self.active_sessions_by_pc_id:
+                    self.active_sessions_by_pc_id[pc_id]["session_timer"] = self._session_timer_payload(client.session_timer)
+        self._persist_session_timers()
 
     def shutdown_targets(self, targets: list[str]) -> list[str]:
         with self.lock:
@@ -2641,24 +2069,10 @@ class TeacherDeployUI:
         self.top_title_label.pack(side="left")
         self.settings_button = ctk.CTkButton(title_row, text="Settings", command=self._open_settings_modal, width=110, height=34, **BUTTON_NEUTRAL)
         self.settings_button.pack(side="right", padx=(8, 0))
-        self.stop_broadcast_btn = ctk.CTkButton(
-            title_row,
-            text="Stop Broadcast",
-            command=self._stop_broadcast_targets,
-            width=140,
-            height=34,
-            **BUTTON_NEUTRAL,
+        self.screen_share_button = ctk.CTkButton(
+            title_row, text="Share Screen", command=self._toggle_screen_share, width=140, height=34, **BUTTON_PRIMARY
         )
-        self.stop_broadcast_btn.pack(side="right", padx=(8, 0))
-        self.broadcast_btn = ctk.CTkButton(
-            title_row,
-            text="Start Broadcast",
-            command=self._start_broadcast_targets,
-            width=140,
-            height=34,
-            **BUTTON_WARNING,
-        )
-        self.broadcast_btn.pack(side="right", padx=(8, 0))
+        self.screen_share_button.pack(side="right", padx=(8, 0))
         self.reservations_button = ctk.CTkButton(
             title_row,
             text="Reservations",
@@ -2677,6 +2091,9 @@ class TeacherDeployUI:
             **BUTTON_NEUTRAL,
         )
         self.chat_btn.pack(side="right", padx=(8, 0), after=self.reservations_button)
+        self.chat_unread_badge = ctk.CTkLabel(
+            title_row, text="●", font=("Arial", 15, "bold"), text_color="#DC2626", fg_color="transparent"
+        )
         self.students_button = ctk.CTkButton(
             title_row,
             text="Students",
@@ -2823,7 +2240,7 @@ class TeacherDeployUI:
         self.dashboard_hint_title.pack(fill="x", padx=10, pady=(6, 2))
         self.dashboard_hint_label = ctk.CTkLabel(
             self.right_controls_frame,
-            text="Select a tile to focus it.\nTick one or more targets.\nBroadcast works on online PCs.",
+            text="Select a tile to focus it or tick one or more targets.",
             font=(self.FONT_FAMILY, 11),
             text_color=TEXT_SECONDARY,
             anchor="w",
@@ -2963,6 +2380,39 @@ class TeacherDeployUI:
         self.server._log_event("ui_callback_error", detail=detail)
         self._set_runtime_notice("Dashboard recovered after a UI callback issue.", ESSU_WARNING, hold_s=20.0)
 
+    def _toggle_screen_share(self) -> None:
+        if self.server.screen_share.active_session_id:
+            self.server.stop_screen_share()
+            self._set_runtime_notice("Screen sharing stopped.", ESSU_WARNING, hold_s=8.0)
+        else:
+            _session_id, target_count = self.server.start_screen_share()
+            if not _session_id:
+                self._set_runtime_notice("Screen sharing requires an online student.", ESSU_WARNING, hold_s=8.0)
+                self._refresh_screen_share_button()
+                return
+            self._set_runtime_notice(f"Screen sharing started for {target_count} online student(s).", ESSU_PRIMARY, hold_s=8.0)
+        self._refresh_screen_share_button()
+
+    def _refresh_screen_share_button(self) -> None:
+        active = bool(self.server.screen_share.active_session_id)
+        viewers = self.server.screen_share.viewer_count()
+        with self.server.lock:
+            eligible = any(client.online and client.control_sock is not None for client in self.server.clients.values())
+        self._configure_if_changed(
+            self.screen_share_button,
+            text=(f"Stop Sharing ({viewers})" if active else "Share Screen"),
+            fg_color=(ESSU_ERROR if active else BUTTON_PRIMARY.get("fg_color")),
+            state="normal" if active or eligible else "disabled",
+        )
+
+    def _refresh_chat_notification(self) -> None:
+        with self.server.lock:
+            unread = sum(int(conversation.get("unread", 0)) for conversation in self.server.conversations.values())
+        if unread:
+            self.chat_unread_badge.place(in_=self.chat_btn, relx=0.82, rely=0.16, anchor="center")
+        else:
+            self.chat_unread_badge.place_forget()
+
     def _on_close_requested(self) -> None:
         if messagebox.askyesno(
             "Exit Admin Dashboard",
@@ -3101,17 +2551,11 @@ class TeacherDeployUI:
         with self.server.lock:
             return [pc for pc in targets if (pc in self.server.clients and self.server.clients[pc].online)]
 
-    def _broadcasting_targets(self, targets: list[str]) -> list[str]:
-        with self.server.lock:
-            active = set(self.server.broadcast_target_ids)
-        return [pc for pc in targets if pc in active]
-
     def _refresh_control_buttons(self) -> None:
         targets = self._selected_targets()
         logged = self._logged_in_targets(targets)
         temp_locked = self._temporary_locked_targets(targets)
         online = self._online_targets(targets)
-        broadcasting = self._broadcasting_targets(targets)
         mode = self.lock_mode_var.get()
 
         if mode in {"Shutdown", "Restart"}:
@@ -3124,18 +2568,11 @@ class TeacherDeployUI:
         can_extend = len(logged) == 1
         selected_ext = int(self.extended_timer_ms_by_pc.get(logged[0], 0)) if len(logged) == 1 else 0
         can_cancel = len(logged) == 1 and selected_ext > 0
-        broadcasting_set = set(broadcasting)
-        startable_targets = [pc for pc in online if pc not in broadcasting_set]
-        stoppable_targets = [pc for pc in online if pc in broadcasting_set]
-        can_broadcast = bool(startable_targets)
-        can_stop_broadcast = bool(stoppable_targets)
 
         self._configure_if_changed(self.lock_btn, text=primary_text, state="normal" if can_lock else "disabled")
         self._configure_if_changed(self.unlock_btn, state="normal" if can_unlock else "disabled")
         self._configure_if_changed(self.extend_timer_btn, state="normal" if can_extend else "disabled")
         self._configure_if_changed(self.cancel_timer_btn, state="normal" if can_cancel else "disabled")
-        self._configure_if_changed(self.broadcast_btn, text="Start Broadcast", state="normal" if can_broadcast else "disabled")
-        self._configure_if_changed(self.stop_broadcast_btn, text="Stop Broadcast", state="normal" if can_stop_broadcast else "disabled")
 
         # can_ext_approve = bool(self.server.settings.enable_extension_requests) and len(logged) == 1
         # self._configure_if_changed(self.approve_ext_btn, state="normal" if can_ext_approve else "disabled")
@@ -3145,6 +2582,7 @@ class TeacherDeployUI:
                 self.chat_btn.pack(side="right", padx=(8, 0), after=self.reservations_button)
             self._configure_if_changed(self.chat_btn, state="normal")
         else:
+            self.chat_unread_badge.place_forget()
             if self.chat_btn.winfo_manager():
                 self.chat_btn.pack_forget()
             if self.chat_sidebar_window is not None and self.chat_sidebar_window.winfo_exists():
@@ -3190,34 +2628,6 @@ class TeacherDeployUI:
         if not temp_locked:
             return
         self.server.unlock_targets(temp_locked)
-        self._refresh_control_buttons()
-
-    def _start_broadcast_targets(self) -> None:
-        targets = self._selected_targets()
-        online_targets = self._online_targets(targets)
-        if not online_targets:
-            return
-        self.server.start_broadcast(online_targets)
-        self._refresh_control_buttons()
-
-    def _stop_broadcast_targets(self) -> None:
-        targets = self._selected_targets()
-        broadcasting = self._broadcasting_targets(targets)
-        if not broadcasting:
-            return
-        self.server.stop_broadcast(broadcasting)
-        self._refresh_control_buttons()
-
-    def _toggle_broadcast_targets(self) -> None:
-        targets = self._selected_targets()
-        online_targets = self._online_targets(targets)
-        if not online_targets:
-            return
-        broadcasting = self._broadcasting_targets(online_targets)
-        if broadcasting and len(broadcasting) == len(online_targets):
-            self.server.stop_broadcast(broadcasting)
-        else:
-            self.server.start_broadcast(online_targets)
         self._refresh_control_buttons()
 
     def _shutdown_targets(self) -> None:
@@ -4705,6 +4115,8 @@ class TeacherDeployUI:
                 self._update_sensor_panel(self.selected_pc)
 
             self._refresh_control_buttons()
+            self._refresh_screen_share_button()
+            self._refresh_chat_notification()
         except Exception as exc:
             self.server._log_event("ui_drain_error", reason=str(exc))
             self._set_runtime_notice("Dashboard recovered after a refresh issue.", ESSU_WARNING, hold_s=20.0)
@@ -4715,7 +4127,10 @@ class TeacherDeployUI:
                 pass
 
     def run(self) -> None:
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            self.server.screen_share.shutdown()
 
 
 def main() -> None:
@@ -4726,33 +4141,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
