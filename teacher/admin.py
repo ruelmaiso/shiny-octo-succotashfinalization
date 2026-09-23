@@ -2614,9 +2614,14 @@ class TeacherDeployUI:
             self._hide_pc_choices_popup()
         else:
             self.root.update_idletasks()
-            x = self.collapse_panel_btn.winfo_rootx()
-            y = self.collapse_panel_btn.winfo_rooty() + self.collapse_panel_btn.winfo_height() + 3
-            self.pc_choices_popup.geometry(f"430x250+{x}+{y}")
+            popup_width, popup_height = 430, 250
+            x = self.selection_section.winfo_rootx()
+            # The toolbar is attached to the dashboard bottom, so opening upward
+            # keeps the dropdown from covering lock/session controls.
+            y = self.collapse_panel_btn.winfo_rooty() - popup_height - 4
+            if y < self.root.winfo_rooty():
+                y = self.collapse_panel_btn.winfo_rooty() + self.collapse_panel_btn.winfo_height() + 3
+            self.pc_choices_popup.geometry(f"{popup_width}x{popup_height}+{x}+{y}")
             self.pc_choices_popup.deiconify()
             self.pc_choices_popup.lift()
             self.bottom_panel_expanded = True
