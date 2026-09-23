@@ -2024,6 +2024,8 @@ class TeacherDeployUI:
         self.selected_pc: Optional[str] = None
         self.tiles: dict[str, dict[str, object]] = {}
         self.target_checks: dict[str, ctk.CTkCheckBox] = {}
+        self.pc_search_var = ctk.StringVar(value="")
+        self.bottom_panel_expanded = True
         self.extended_timer_ms_by_pc: dict[str, int] = {}
         self._font_cache: dict[int, ImageFont.ImageFont] = {}
         self._last_tile_repaint_ts: dict[str, float] = {}
@@ -2182,24 +2184,35 @@ class TeacherDeployUI:
         self.grid_scroll.pack_propagate(False)
 
         # =========================
-        # 3) BOTTOM BAR (Fixed Height = 160) — UNCHANGED
+        # 3) BOTTOM ACTION PANEL (fixed, collapsible)
         # =========================
-        bottom = ctk.CTkFrame(self.root, height=86, fg_color=CARD_BG, border_width=1, border_color=BORDER_SUBTLE)
+        bottom = ctk.CTkFrame(self.root, height=168, fg_color=CARD_BG, border_width=1, border_color=BORDER_SUBTLE)
         self.bottom_bar = bottom
         bottom.pack(fill="x", padx=10, pady=(6, 8))
         bottom.pack_propagate(False)
 
-        self.targets_frame = ctk.CTkScrollableFrame(bottom, width=450, fg_color=CARD_BG)
-        self.targets_frame.pack(side="left", fill="both", expand=False, padx=8, pady=10)
+        self.selection_section = ctk.CTkFrame(bottom, fg_color="transparent")
+        self.selection_section.pack(fill="x", padx=12, pady=(8, 2))
+        self.selection_header = ctk.CTkFrame(self.selection_section, fg_color="transparent")
+        self.selection_header.pack(fill="x")
+        self.pc_selection_label = ctk.CTkLabel(self.selection_header, text="PC Selection", font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_SECONDARY)
+        self.pc_selection_label.pack(side="left", padx=(0, 10))
+        self.pc_search_entry = ctk.CTkEntry(self.selection_header, textvariable=self.pc_search_var, placeholder_text="Search PC...", width=180, height=30)
+        self.pc_search_entry.pack(side="left", padx=4)
+        self.select_all_available_btn = ctk.CTkButton(self.selection_header, text="Select All Available", command=self._select_all_available, width=150, height=30, **BUTTON_NEUTRAL)
+        self.select_all_available_btn.pack(side="left", padx=4)
+        self.clear_selection_btn = ctk.CTkButton(self.selection_header, text="Clear", command=self._clear_pc_selection, width=74, height=30, **BUTTON_NEUTRAL)
+        self.clear_selection_btn.pack(side="left", padx=4)
+        self.selection_summary_label = ctk.CTkLabel(self.selection_header, text="Selected: None", font=(self.FONT_FAMILY, 12), text_color=TEXT_SECONDARY, anchor="w")
+        self.selection_summary_label.pack(side="left", fill="x", expand=True, padx=(12, 6))
 
-        self.left_controls_frame = ctk.CTkFrame(bottom, fg_color=CARD_BG)
-        self.left_controls_frame.pack(side="left", fill="both", expand=True, padx=12, pady=10)
+        self.targets_frame = ctk.CTkScrollableFrame(self.selection_section, height=42, fg_color=CARD_BG)
+        self.targets_frame.pack(fill="x", pady=(4, 0))
 
-        self.right_controls_frame = ctk.CTkFrame(bottom, width=190, fg_color=CARD_BG)
-        self.right_controls_frame.pack(side="right", fill="y", expand=False, padx=(4, 10), pady=10)
-        self.right_controls_frame.pack_propagate(False)
+        self.action_controls_frame = ctk.CTkFrame(bottom, fg_color="transparent")
+        self.action_controls_frame.pack(fill="x", padx=12, pady=(4, 8))
 
-        action_group = ctk.CTkFrame(self.left_controls_frame, fg_color="transparent")
+        action_group = ctk.CTkFrame(self.action_controls_frame, fg_color="transparent")
         action_group.pack(side="left", padx=(8, 16))
         self.lock_mode_label = ctk.CTkLabel(action_group, text="Action Mode", font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_SECONDARY)
         self.lock_mode_label.pack(side="left", padx=(0, 6))
@@ -2218,7 +2231,7 @@ class TeacherDeployUI:
         self.unlock_btn.pack(side="left", padx=4)
         self.lock_mode_var.trace_add("write", lambda *_args: self._refresh_control_buttons())
 
-        timer_group = ctk.CTkFrame(self.left_controls_frame, fg_color="transparent")
+        timer_group = ctk.CTkFrame(self.action_controls_frame, fg_color="transparent")
         timer_group.pack(side="left", padx=(12, 6))
         self.timer_title_label = ctk.CTkLabel(timer_group, text="Extend Session", font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_SECONDARY)
         self.timer_title_label.pack(side="left", padx=(0, 8))
@@ -2229,35 +2242,10 @@ class TeacherDeployUI:
         self.cancel_timer_btn = ctk.CTkButton(timer_group, text="Cancel", command=self._cancel_timer, width=96, height=34, **BUTTON_NEUTRAL)
         self.cancel_timer_btn.pack(side="left", padx=4)
 
-        self.dashboard_hint_title = ctk.CTkLabel(
-            self.right_controls_frame,
-            text="Quick Guide",
-            font=(self.FONT_FAMILY, 12, "bold"),
-            text_color=TEXT_PRIMARY,
-            anchor="w",
-            justify="left",
-        )
-        self.dashboard_hint_title.pack(fill="x", padx=10, pady=(6, 2))
-        self.dashboard_hint_label = ctk.CTkLabel(
-            self.right_controls_frame,
-            text="Select a tile to focus it or tick one or more targets.",
-            font=(self.FONT_FAMILY, 11),
-            text_color=TEXT_SECONDARY,
-            anchor="w",
-            justify="left",
-            wraplength=160,
-        )
-        self.dashboard_hint_label.pack(fill="x", padx=10, pady=(0, 6))
-        self.runtime_notice_label = ctk.CTkLabel(
-            self.right_controls_frame,
-            text=self._runtime_notice_default,
-            font=(self.FONT_FAMILY, 11),
-            text_color=TEXT_SECONDARY,
-            anchor="w",
-            justify="left",
-            wraplength=160,
-        )
-        self.runtime_notice_label.pack(fill="x", padx=10, pady=(0, 6))
+        self.collapse_panel_btn = ctk.CTkButton(self.action_controls_frame, text="Collapse ▼", command=self._toggle_bottom_panel, width=104, height=30, **BUTTON_NEUTRAL)
+        self.collapse_panel_btn.pack(side="right", padx=(8, 0))
+        self.runtime_notice_label = ctk.CTkLabel(self.action_controls_frame, text=self._runtime_notice_default, font=(self.FONT_FAMILY, 11), text_color=TEXT_SECONDARY, anchor="e", justify="right")
+        self.runtime_notice_label.pack(side="right", fill="x", expand=True, padx=8)
 
         # self.approve_ext_btn = ctk.CTkButton(self.left_controls_frame, text="Approve Extension", command=self._approve_extension_selected, width=140, **BUTTON_WARNING)
         # self.approve_ext_btn.pack(side="right", padx=4, pady=8)
@@ -2265,6 +2253,7 @@ class TeacherDeployUI:
 
 
         self._apply_theme_to_ui()
+        self.pc_search_var.trace_add("write", lambda *_args: self._filter_target_checks())
         self._refresh_control_buttons()
         self.root.after(100, self._drain_queues)
 
@@ -2293,9 +2282,9 @@ class TeacherDeployUI:
         for frame in (
             getattr(self, "top_bar", None),
             getattr(self, "bottom_bar", None),
+            getattr(self, "selection_section", None),
             getattr(self, "targets_frame", None),
-            getattr(self, "left_controls_frame", None),
-            getattr(self, "right_controls_frame", None),
+            getattr(self, "action_controls_frame", None),
         ):
             if frame is not None:
                 frame.configure(fg_color=colors["card_bg"], border_color=colors["border"])
@@ -2309,15 +2298,18 @@ class TeacherDeployUI:
             self.lock_mode_label.configure(text_color=colors["text_secondary"])
         if hasattr(self, "timer_title_label"):
             self.timer_title_label.configure(text_color=colors["text_secondary"])
-        if hasattr(self, "dashboard_hint_title"):
-            self.dashboard_hint_title.configure(text_color=colors["text_primary"])
-        if hasattr(self, "dashboard_hint_label"):
-            self.dashboard_hint_label.configure(text_color=colors["text_secondary"])
+        if hasattr(self, "pc_selection_label"):
+            self.pc_selection_label.configure(text_color=colors["text_secondary"])
+        if hasattr(self, "selection_summary_label"):
+            self.selection_summary_label.configure(text_color=colors["text_secondary"])
         if hasattr(self, "runtime_notice_label") and (time.time() >= getattr(self, "_runtime_notice_until_ts", 0.0)):
             self.runtime_notice_label.configure(text_color=colors["text_secondary"])
         if hasattr(self, "timer_entry"):
             entry_bg = "#262d38" if ctk.get_appearance_mode().lower() == "dark" else "#FAFAFA"
             self.timer_entry.configure(fg_color=entry_bg, text_color=colors["text_primary"], border_color=colors["border"])
+        if hasattr(self, "pc_search_entry"):
+            entry_bg = "#262d38" if ctk.get_appearance_mode().lower() == "dark" else "#FAFAFA"
+            self.pc_search_entry.configure(fg_color=entry_bg, text_color=colors["text_primary"], border_color=colors["border"])
         for title_label in getattr(self, "sensor_title_labels", []):
             title_label.configure(text_color=colors["text_secondary"])
         for value_label in self.sensor_value_labels.values():
@@ -2519,18 +2511,88 @@ class TeacherDeployUI:
             text=f"{pc_id}",
             text_color=colors["text_primary"],
             border_color=colors["border"],
-            command=self._refresh_control_buttons,
+            command=self._on_target_selection_changed,
         )
         cb_index = len(self.target_checks)
         cb_row = cb_index % 2
         cb_col = cb_index // 2
         cb.grid(row=cb_row, column=cb_col, padx=8, pady=4, sticky="w")
         self.target_checks[pc_id] = cb
+        self._filter_target_checks()
+
+    def _on_target_selection_changed(self) -> None:
+        self._refresh_selection_summary()
+        self._refresh_control_buttons()
+
+    def _filter_target_checks(self) -> None:
+        """Show matching existing target controls without changing their selection."""
+        query = self.pc_search_var.get().strip().lower()
+        for pc_id, checkbox in self.target_checks.items():
+            if not query or query in pc_id.lower():
+                checkbox.grid()
+            else:
+                checkbox.grid_remove()
+
+    def _available_pc_ids(self) -> set[str]:
+        """Use the dashboard's existing online client state for bulk selection."""
+        with self.server.lock:
+            return {pc_id for pc_id, client in self.server.clients.items() if client.online}
+
+    def _select_all_available(self) -> None:
+        available = self._available_pc_ids()
+        for pc_id, checkbox in self.target_checks.items():
+            if pc_id in available:
+                checkbox.select()
+            else:
+                checkbox.deselect()
+        self._on_target_selection_changed()
+
+    def _clear_pc_selection(self) -> None:
+        """Clear UI selection only; client and session state remain untouched."""
+        for checkbox in self.target_checks.values():
+            checkbox.deselect()
+        self.selected_pc = None
+        self.selected_history_button.configure(state="disabled")
+        self._refresh_selection_summary()
+        self._refresh_control_buttons()
+
+    def _refresh_selection_summary(self) -> None:
+        targets = self._selected_targets()
+        if not targets:
+            summary = "Selected: None"
+        elif len(targets) <= 4:
+            summary = f"Selected: {', '.join(targets)}"
+        else:
+            summary = f"Selected: {len(targets)} PCs"
+        self._configure_if_changed(self.selection_summary_label, text=summary)
+
+    def _toggle_bottom_panel(self) -> None:
+        self.bottom_panel_expanded = not self.bottom_panel_expanded
+        if self.bottom_panel_expanded:
+            self.bottom_bar.configure(height=168)
+            self.selection_section.pack(fill="x", padx=12, pady=(8, 2), before=self.action_controls_frame)
+            self.pc_selection_label.pack(side="left", padx=(0, 10), before=self.selection_summary_label)
+            self.pc_search_entry.pack(side="left", padx=4, before=self.selection_summary_label)
+            self.select_all_available_btn.pack(side="left", padx=4, before=self.selection_summary_label)
+            self.clear_selection_btn.pack(side="left", padx=4, before=self.selection_summary_label)
+            self.targets_frame.pack(fill="x", pady=(4, 0))
+            self._configure_if_changed(self.collapse_panel_btn, text="Collapse ▼")
+        else:
+            self.bottom_bar.configure(height=62)
+            self.targets_frame.pack_forget()
+            self.pc_selection_label.pack_forget()
+            self.pc_search_entry.pack_forget()
+            self.select_all_available_btn.pack_forget()
+            self.clear_selection_btn.pack_forget()
+            self.selection_section.pack(fill="x", padx=12, pady=(6, 0), before=self.action_controls_frame)
+            self._configure_if_changed(self.collapse_panel_btn, text="Expand ▲")
+        self._refresh_selection_summary()
 
     def _select_pc(self, pc_id: str) -> None:
         self.selected_pc = pc_id
         self.selected_history_button.configure(state="normal")
         self._update_sensor_panel(pc_id)
+        self._refresh_selection_summary()
         self._refresh_control_buttons()
 
     def _selected_targets(self) -> list[str]:
@@ -2553,6 +2615,7 @@ class TeacherDeployUI:
 
     def _refresh_control_buttons(self) -> None:
         targets = self._selected_targets()
+        self._refresh_selection_summary()
         logged = self._logged_in_targets(targets)
         temp_locked = self._temporary_locked_targets(targets)
         online = self._online_targets(targets)
@@ -2565,9 +2628,8 @@ class TeacherDeployUI:
             can_lock = bool(logged)
             primary_text = "Apply Lock Mode"
         can_unlock = bool(temp_locked)
-        can_extend = len(logged) == 1
-        selected_ext = int(self.extended_timer_ms_by_pc.get(logged[0], 0)) if len(logged) == 1 else 0
-        can_cancel = len(logged) == 1 and selected_ext > 0
+        can_extend = bool(logged)
+        can_cancel = any(int(self.extended_timer_ms_by_pc.get(pc_id, 0)) > 0 for pc_id in logged)
 
         self._configure_if_changed(self.lock_btn, text=primary_text, state="normal" if can_lock else "disabled")
         self._configure_if_changed(self.unlock_btn, state="normal" if can_unlock else "disabled")
@@ -2662,15 +2724,15 @@ class TeacherDeployUI:
     def _extend_timer(self) -> None:
         targets = self._selected_targets()
         logged_targets = self._logged_in_targets(targets)
-        if len(logged_targets) != 1:
+        if not logged_targets:
             return
         minutes = self._timer_minutes_from_input()
         if minutes is None:
             return
-        pc_id = logged_targets[0]
         extra_ms = int(minutes * 60_000)
-        self.server.extend_timer([pc_id], extra_ms)
-        self.extended_timer_ms_by_pc[pc_id] = int(self.extended_timer_ms_by_pc.get(pc_id, 0)) + extra_ms
+        self.server.extend_timer(logged_targets, extra_ms)
+        for pc_id in logged_targets:
+            self.extended_timer_ms_by_pc[pc_id] = int(self.extended_timer_ms_by_pc.get(pc_id, 0)) + extra_ms
         self._refresh_control_buttons()
 
     def _cancel_timer(self) -> None:
