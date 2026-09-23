@@ -2025,7 +2025,7 @@ class TeacherDeployUI:
         self.tiles: dict[str, dict[str, object]] = {}
         self.target_checks: dict[str, ctk.CTkCheckBox] = {}
         self.pc_search_var = ctk.StringVar(value="")
-        self.bottom_panel_expanded = True
+        self.bottom_panel_expanded = False
         self.extended_timer_ms_by_pc: dict[str, int] = {}
         self._font_cache: dict[int, ImageFont.ImageFont] = {}
         self._last_tile_repaint_ts: dict[str, float] = {}
@@ -2199,21 +2199,10 @@ class TeacherDeployUI:
         self.pc_selection_label = ctk.CTkLabel(self.selection_header, text="PC Selection", font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_SECONDARY)
         self.pc_selection_label.pack(side="left")
         self.selection_summary_label = ctk.CTkLabel(self.selection_header, text="Selected: None", font=(self.FONT_FAMILY, 11), text_color=TEXT_SECONDARY, anchor="w")
-        self.selection_summary_label.pack(side="right")
-
-        self.selection_controls = ctk.CTkFrame(self.selection_section, fg_color="transparent")
-        self.selection_controls.pack(fill="x", pady=(1, 1))
-        self.pc_search_entry = ctk.CTkEntry(self.selection_controls, textvariable=self.pc_search_var, placeholder_text="Search PC...", width=112, height=26)
-        self.pc_search_entry.pack(side="left", padx=(0, 3))
-        self.select_all_available_btn = ctk.CTkButton(self.selection_controls, text="Select Available", command=self._select_all_available, width=116, height=26, **BUTTON_NEUTRAL)
-        self.select_all_available_btn.pack(side="left", padx=3)
-        self.clear_selection_btn = ctk.CTkButton(self.selection_controls, text="Clear", command=self._clear_pc_selection, width=52, height=26, **BUTTON_NEUTRAL)
-        self.clear_selection_btn.pack(side="left", padx=3)
-        self.collapse_panel_btn = ctk.CTkButton(self.selection_controls, text="Hide PCs ▲", command=self._toggle_bottom_panel, width=82, height=26, **BUTTON_NEUTRAL)
-        self.collapse_panel_btn.pack(side="left", padx=(3, 0))
-
-        self.targets_frame = ctk.CTkScrollableFrame(self.selection_section, height=22, fg_color=CARD_BG)
-        self.targets_frame.pack(fill="both", expand=True, pady=(2, 0))
+        self.selection_summary_label.pack(side="left", padx=(14, 0))
+        self.collapse_panel_btn = ctk.CTkButton(self.selection_header, text="Show PCs ▼", command=self._toggle_bottom_panel, width=94, height=28, **BUTTON_NEUTRAL)
+        self.collapse_panel_btn.pack(side="right")
+        self._build_pc_choices_popup()
 
         self.selection_divider = ctk.CTkFrame(bottom, width=1, fg_color=BORDER_SUBTLE)
         self.selection_divider.pack(side="left", fill="y", padx=(2, 8), pady=12)
@@ -2287,6 +2276,41 @@ class TeacherDeployUI:
             "border": BORDER_SUBTLE,
         }
 
+    def _build_pc_choices_popup(self) -> None:
+        """Build one reusable dropdown that owns the existing target checkboxes."""
+        colors = self._theme_palette()
+        popup = ctk.CTkToplevel(self.root)
+        popup.withdraw()
+        popup.overrideredirect(True)
+        popup.transient(self.root)
+        popup.configure(fg_color=colors["card_bg"])
+        popup.protocol("WM_DELETE_WINDOW", self._hide_pc_choices_popup)
+        self.pc_choices_popup = popup
+
+        body = ctk.CTkFrame(popup, width=430, height=250, fg_color=colors["card_bg"], border_width=1, border_color=colors["border"])
+        body.pack(fill="both", expand=True)
+        body.pack_propagate(False)
+        self.pc_choices_popup_body = body
+
+        controls = ctk.CTkFrame(body, fg_color="transparent")
+        controls.pack(fill="x", padx=8, pady=(8, 4))
+        self.pc_search_entry = ctk.CTkEntry(controls, textvariable=self.pc_search_var, placeholder_text="Search PC...", width=132, height=28)
+        self.pc_search_entry.pack(side="left", padx=(0, 4))
+        self.select_all_available_btn = ctk.CTkButton(controls, text="Select Available", command=self._select_all_available, width=118, height=28, **BUTTON_NEUTRAL)
+        self.select_all_available_btn.pack(side="left", padx=4)
+        self.clear_selection_btn = ctk.CTkButton(controls, text="Clear", command=self._clear_pc_selection, width=58, height=28, **BUTTON_NEUTRAL)
+        self.clear_selection_btn.pack(side="left", padx=4)
+        ctk.CTkButton(controls, text="Done", command=self._hide_pc_choices_popup, width=58, height=28, **BUTTON_NEUTRAL).pack(side="right")
+
+        self.targets_frame = ctk.CTkScrollableFrame(body, height=192, fg_color=colors["card_bg"])
+        self.targets_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+    def _hide_pc_choices_popup(self) -> None:
+        if hasattr(self, "pc_choices_popup"):
+            self.pc_choices_popup.withdraw()
+        self.bottom_panel_expanded = False
+        self._configure_if_changed(self.collapse_panel_btn, text="Show PCs ▼")
+
     def _apply_theme_to_ui(self) -> None:
         colors = self._theme_palette()
         self.root.configure(fg_color=colors["root_bg"])
@@ -2294,7 +2318,6 @@ class TeacherDeployUI:
             getattr(self, "top_bar", None),
             getattr(self, "bottom_bar", None),
             getattr(self, "selection_section", None),
-            getattr(self, "selection_controls", None),
             getattr(self, "targets_frame", None),
             getattr(self, "action_controls_frame", None),
             getattr(self, "right_controls_frame", None),
@@ -2315,6 +2338,10 @@ class TeacherDeployUI:
             self.pc_selection_label.configure(text_color=colors["text_secondary"])
         if hasattr(self, "selection_divider"):
             self.selection_divider.configure(fg_color=colors["border"])
+        if hasattr(self, "pc_choices_popup"):
+            self.pc_choices_popup.configure(fg_color=colors["card_bg"])
+        if hasattr(self, "pc_choices_popup_body"):
+            self.pc_choices_popup_body.configure(fg_color=colors["card_bg"], border_color=colors["border"])
         if hasattr(self, "selection_summary_label"):
             self.selection_summary_label.configure(text_color=colors["text_secondary"])
         if hasattr(self, "runtime_notice_label") and (time.time() >= getattr(self, "_runtime_notice_until_ts", 0.0)):
@@ -2582,14 +2609,19 @@ class TeacherDeployUI:
         self._configure_if_changed(self.selection_summary_label, text=summary)
 
     def _toggle_bottom_panel(self) -> None:
-        """Collapse only the PC-choice list; keep the original bottom bar layout fixed."""
-        self.bottom_panel_expanded = not self.bottom_panel_expanded
+        """Show or hide the PC-choice dropdown without moving the bottom toolbar."""
         if self.bottom_panel_expanded:
-            self.targets_frame.pack(fill="both", expand=True, pady=(2, 0))
-            self._configure_if_changed(self.collapse_panel_btn, text="Hide PCs ▲")
+            self._hide_pc_choices_popup()
         else:
-            self.targets_frame.pack_forget()
-            self._configure_if_changed(self.collapse_panel_btn, text="Show PCs ▼")
+            self.root.update_idletasks()
+            x = self.collapse_panel_btn.winfo_rootx()
+            y = self.collapse_panel_btn.winfo_rooty() + self.collapse_panel_btn.winfo_height() + 3
+            self.pc_choices_popup.geometry(f"430x250+{x}+{y}")
+            self.pc_choices_popup.deiconify()
+            self.pc_choices_popup.lift()
+            self.bottom_panel_expanded = True
+            self._configure_if_changed(self.collapse_panel_btn, text="Hide PCs ▲")
+            self.pc_search_entry.focus_set()
         self._refresh_selection_summary()
 
     def _select_pc(self, pc_id: str) -> None:
