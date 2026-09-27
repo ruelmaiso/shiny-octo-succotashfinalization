@@ -1930,8 +1930,10 @@ class StudentDeployClient:
             return self._restore_overlay_state()
 
     def _connect_control(self) -> bool:
+        sock: Optional[socket.socket] = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(8.0)
             sock.connect((self.teacher_ip, NETWORK.control_port))
             file_obj = sock.makefile("rb")
             with self.conn_lock:
@@ -1942,6 +1944,7 @@ class StudentDeployClient:
             if not ack or ack.get("type") != "register_ack":
                 self._cleanup_sockets()
                 return False
+            sock.settimeout(None)
             self.pc_id = str(ack.get("pc_id"))
             self.enable_session_messaging = bool(ack.get("enable_session_messaging", False))
             self.enable_extension_requests = bool(ack.get("enable_extension_requests", False))
@@ -1958,20 +1961,33 @@ class StudentDeployClient:
                 return False
             return True
         except (OSError, ValueError):
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
             self._cleanup_sockets()
             return False
 
     def _connect_video(self) -> bool:
         if not self.pc_id:
             return False
+        sock: Optional[socket.socket] = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(8.0)
             sock.connect((self.teacher_ip, NETWORK.video_port))
             send_json(sock, {"type": "video_register", "pc_id": self.pc_id})
+            sock.settimeout(None)
             with self.conn_lock:
                 self.video_sock = sock
             return True
         except OSError:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
             return False
 
     def _cleanup_sockets(self) -> None:
@@ -2226,7 +2242,6 @@ def main() -> None:
     settings_store = StudentSettingsStore(default_teacher_host=NETWORK.teacher_connect_host)
     settings = settings_store.load()
     client = StudentDeployClient(settings.teacher_host, settings_store=settings_store)
-    client = StudentDeployClient(NETWORK.teacher_host)
     try:
         client.run()
     except KeyboardInterrupt:

@@ -1,4 +1,5 @@
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ class ClientRegistry:
     def __init__(self, file_path: Path):
         self.file_path = file_path
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
         self._data = self._load()
 
     def _load(self) -> dict[str, Any]:
@@ -37,22 +39,24 @@ class ClientRegistry:
 
     def get_or_assign_id(self, mac: str, hostname: str) -> str:
         normalized_mac = mac.strip().lower()
-        for client in self._data["clients"]:
-            if client["mac"] == normalized_mac:
-                client["hostname"] = hostname
-                self._save(self._data)
-                return client["pc_id"]
+        with self._lock:
+            for client in self._data["clients"]:
+                if client["mac"] == normalized_mac:
+                    client["hostname"] = hostname
+                    self._save(self._data)
+                    return client["pc_id"]
 
-        pc_id = f"PC{self._data['next_id']:02d}"
-        self._data["next_id"] += 1
-        self._data["clients"].append({"mac": normalized_mac, "hostname": hostname, "pc_id": pc_id})
-        self._save(self._data)
-        return pc_id
+            pc_id = f"PC{self._data['next_id']:02d}"
+            self._data["next_id"] += 1
+            self._data["clients"].append({"mac": normalized_mac, "hostname": hostname, "pc_id": pc_id})
+            self._save(self._data)
+            return pc_id
 
     def list_pc_ids(self) -> list[str]:
-        pc_ids = []
-        for client in self._data.get("clients", []):
-            pc_id = str(client.get("pc_id", "")).strip()
-            if pc_id:
-                pc_ids.append(pc_id)
+        with self._lock:
+            pc_ids = [
+                str(client.get("pc_id", "")).strip()
+                for client in self._data.get("clients", [])
+                if str(client.get("pc_id", "")).strip()
+            ]
         return sorted(set(pc_ids))
