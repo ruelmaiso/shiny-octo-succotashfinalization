@@ -17,7 +17,6 @@ from typing import Optional
 
 import cv2
 import customtkinter as ctk
-import mss
 import numpy
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
@@ -29,7 +28,7 @@ from config.deploy_settings import NETWORK, RUNTIME
 from core.auth_db import AuthDatabase
 from core.client_registry import ClientRegistry
 from core.heartbeat import HeartbeatState
-from core.protocol import recv_frame, recv_json_line, send_frame, send_json
+from core.protocol import recv_frame, recv_json_line, send_json
 from core.screen_share import ScreenShareBroadcaster
 from core.app_settings import AppSettings, SettingsStore
 from teacher.reservations import ReservationManager
@@ -1378,7 +1377,6 @@ class TeacherDeployServer:
             role = str(reg.get("role", "uplink")).strip().lower() or "uplink"
             if role != "uplink":
                 return
-            registration_diag: dict[str, object] = {"pc_id": pc_id, "role": role, "accepted_socket_id": id(client_sock)}
             with self.lock:
                 if pc_id not in self.clients:
                     self._log_event("video_registration_unknown_client", pc_id=pc_id)
@@ -2052,9 +2050,9 @@ class TeacherDeployUI:
         )
 
         # =========================
-        # 1) TOP BAR (Fixed Height = 160) — SENSOR PANEL
+        # 1) TOP BAR — SENSOR PANEL
         # =========================
-        top = ctk.CTkFrame(self.root, height=122, fg_color=CARD_BG, border_width=1, border_color=BORDER_SUBTLE)
+        top = ctk.CTkFrame(self.root, height=174, fg_color=CARD_BG, border_width=1, border_color=BORDER_SUBTLE)
         self.top_bar = top
         top.pack(fill="x", padx=12, pady=(10, 6))
         top.pack_propagate(False)
@@ -2138,20 +2136,20 @@ class TeacherDeployUI:
             ("sensor_age", "Last sensor update", "--"),
             ("system", "System Online", "--"),
         ]
-        group_breaks = {"uptime", "session_left"}
-        for key, title, initial in sensor_fields:
+        # Two rows prevent the 14 metrics from being clipped on common
+        # 1366px laptop and projector displays.
+        sensor_columns = 7
+        for column in range(sensor_columns):
+            sensor_row.grid_columnconfigure(column, weight=1, uniform="sensor")
+        for index, (key, title, initial) in enumerate(sensor_fields):
             block = ctk.CTkFrame(sensor_row, fg_color="transparent")
-            block.pack(side="left", padx=22)
+            block.grid(row=index // sensor_columns, column=index % sensor_columns, sticky="ew", padx=10, pady=4)
             title_label = ctk.CTkLabel(block, text=title, font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_SECONDARY)
             title_label.pack(anchor="w")
             self.sensor_title_labels.append(title_label)
             value_label = ctk.CTkLabel(block, text=initial, font=(self.FONT_FAMILY, 12), text_color=TEXT_PRIMARY)
             value_label.pack(anchor="w")
             self.sensor_value_labels[key] = value_label
-            if key in group_breaks:
-                sep = ctk.CTkFrame(sensor_row, width=1, height=36, fg_color=BORDER_SUBTLE)
-                sep.pack(side="left", padx=(2, 12), pady=(2, 0))
-                self.sensor_separators.append(sep)
 
         # =========================
         # 2) MIDDLE (ONLY EXPANDABLE AREA)
@@ -2186,12 +2184,12 @@ class TeacherDeployUI:
         # =========================
         # 3) BOTTOM ACTION PANEL (original fixed height)
         # =========================
-        bottom = ctk.CTkFrame(self.root, height=86, fg_color=CARD_BG, border_width=1, border_color=BORDER_SUBTLE)
+        bottom = ctk.CTkFrame(self.root, height=116, fg_color=CARD_BG, border_width=1, border_color=BORDER_SUBTLE)
         self.bottom_bar = bottom
         bottom.pack(fill="x", padx=10, pady=(6, 8))
         bottom.pack_propagate(False)
 
-        self.selection_section = ctk.CTkFrame(bottom, width=430, fg_color=CARD_BG)
+        self.selection_section = ctk.CTkFrame(bottom, width=330, fg_color=CARD_BG)
         self.selection_section.pack(side="left", fill="both", expand=False, padx=(8, 4), pady=5)
         self.selection_section.pack_propagate(False)
         self.selection_header = ctk.CTkFrame(self.selection_section, fg_color="transparent")
@@ -2211,7 +2209,7 @@ class TeacherDeployUI:
         self.action_controls_frame.pack(side="left", fill="both", expand=True, padx=12, pady=10)
 
         action_group = ctk.CTkFrame(self.action_controls_frame, fg_color="transparent")
-        action_group.pack(side="left", padx=(8, 16))
+        action_group.pack(fill="x", padx=(8, 6), pady=(0, 6))
         self.lock_mode_label = ctk.CTkLabel(action_group, text="Action Mode", font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_SECONDARY)
         self.lock_mode_label.pack(side="left", padx=(0, 6))
         self.lock_mode_var = ctk.StringVar(value="Temporary Lock")
@@ -2230,7 +2228,7 @@ class TeacherDeployUI:
         self.lock_mode_var.trace_add("write", lambda *_args: self._refresh_control_buttons())
 
         timer_group = ctk.CTkFrame(self.action_controls_frame, fg_color="transparent")
-        timer_group.pack(side="left", padx=(12, 6))
+        timer_group.pack(fill="x", padx=(8, 6))
         self.timer_title_label = ctk.CTkLabel(timer_group, text="Extend Session", font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_SECONDARY)
         self.timer_title_label.pack(side="left", padx=(0, 8))
         self.timer_entry = ctk.CTkEntry(timer_group, placeholder_text="Minutes", width=92, height=34, fg_color="#FAFAFA", border_color=BORDER_SUBTLE, text_color=TEXT_PRIMARY)
@@ -4013,20 +4011,7 @@ class TeacherDeployUI:
             elif rem <= warning_rem_s:
                 session_left_color = ESSU_WARNING
 
-        timer_remaining = "--"
         timer_extended = "00:00"
-        with self.server.lock:
-            now = time.time()
-            remaining_values = [
-                max(0, int(timer.duration_ms - ((now - timer.start_ts) * 1000)))
-                for timer in self.server.timers.values()
-                if timer.active and pc_id in timer.targets
-            ]
-        if remaining_values:
-            remaining_ms = min(remaining_values)
-            mins, secs = divmod(remaining_ms // 1000, 60)
-            timer_remaining = f"{mins:02d}:{secs:02d}"
-
         ext_ms = int(self.extended_timer_ms_by_pc.get(pc_id, 0))
         ext_mins, ext_secs = divmod(max(0, ext_ms) // 1000, 60)
         timer_extended = f"{ext_mins:02d}:{ext_secs:02d}"

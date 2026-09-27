@@ -56,18 +56,18 @@ class ReservationManagementPanel:
         ctk.CTkLabel(form, text="PC ID", text_color=colors["text_primary"]).grid(row=0, column=1, sticky="w", padx=6, pady=(0, 4))
         ctk.CTkOptionMenu(form, variable=pc_var, values=pc_ids, height=34).grid(row=1, column=1, sticky="ew", padx=6)
 
-        ctk.CTkLabel(form, text="Start (YYYY-MM-DD HH:MM)", text_color=colors["text_primary"]).grid(row=0, column=2, sticky="w", padx=6, pady=(0, 4))
-        start_entry = ctk.CTkEntry(form, placeholder_text="YYYY-MM-DD HH:MM")
-        start_entry.grid(row=1, column=2, sticky="ew", padx=6)
-
-        ctk.CTkLabel(form, text="End (YYYY-MM-DD HH:MM)", text_color=colors["text_primary"]).grid(row=0, column=3, sticky="w", padx=6, pady=(0, 4))
-        end_entry = ctk.CTkEntry(form, placeholder_text="YYYY-MM-DD HH:MM")
-        end_entry.grid(row=1, column=3, sticky="ew", padx=6)
-
-        ctk.CTkLabel(form, text="Created By", text_color=colors["text_primary"]).grid(row=0, column=4, sticky="w", padx=6, pady=(0, 4))
+        ctk.CTkLabel(form, text="Created By", text_color=colors["text_primary"]).grid(row=0, column=2, sticky="w", padx=6, pady=(0, 4))
         created_by_entry = ctk.CTkEntry(form, placeholder_text="admin")
         created_by_entry.insert(0, "admin")
-        created_by_entry.grid(row=1, column=4, sticky="ew", padx=6)
+        created_by_entry.grid(row=1, column=2, sticky="ew", padx=6)
+
+        ctk.CTkLabel(form, text="Start (YYYY-MM-DD HH:MM)", text_color=colors["text_primary"]).grid(row=2, column=0, sticky="w", padx=6, pady=(12, 4))
+        start_entry = ctk.CTkEntry(form, placeholder_text="YYYY-MM-DD HH:MM")
+        start_entry.grid(row=3, column=0, sticky="ew", padx=6)
+
+        ctk.CTkLabel(form, text="End (YYYY-MM-DD HH:MM)", text_color=colors["text_primary"]).grid(row=2, column=1, sticky="w", padx=6, pady=(12, 4))
+        end_entry = ctk.CTkEntry(form, placeholder_text="YYYY-MM-DD HH:MM")
+        end_entry.grid(row=3, column=1, sticky="ew", padx=6)
 
         # UI POLISH ONLY
         ctk.CTkLabel(
@@ -75,13 +75,11 @@ class ReservationManagementPanel:
             text="Use YYYY-MM-DD HH:MM for both date fields.",
             font=(self.font_family, 11),
             text_color=colors["text_secondary"],
-        ).grid(row=2, column=0, columnspan=5, sticky="w", padx=6, pady=(8, 0))
+        ).grid(row=4, column=0, columnspan=3, sticky="w", padx=6, pady=(8, 0))
 
         form.grid_columnconfigure(0, weight=1)
         form.grid_columnconfigure(1, weight=1)
         form.grid_columnconfigure(2, weight=1)
-        form.grid_columnconfigure(3, weight=1)
-        form.grid_columnconfigure(4, weight=1)
 
         actions = ctk.CTkFrame(self.window, fg_color="transparent")
         actions.pack(fill="x", padx=16, pady=(0, 6))
@@ -139,14 +137,18 @@ class ReservationManagementPanel:
             status_var.set("Reservation cancelled successfully.")
             self._render_rows()
 
-        ctk.CTkButton(actions, text="Now / +1h", command=fill_now_plus_1h, width=120, **secondary_button).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(actions, text="Create Reservation", command=create_reservation, width=160, **primary_button).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(actions, text="Refresh List", command=self._render_rows, width=112, **secondary_button).pack(side="left", padx=(0, 8))
+        create_actions = ctk.CTkFrame(actions, fg_color="transparent")
+        create_actions.pack(side="left")
+        ctk.CTkButton(create_actions, text="Now / +1h", command=fill_now_plus_1h, width=120, **secondary_button).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(create_actions, text="Create Reservation", command=create_reservation, width=160, **primary_button).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(create_actions, text="Refresh List", command=self._render_rows, width=112, **secondary_button).pack(side="left")
 
-        ctk.CTkLabel(actions, text="Reservation ID", text_color=colors["text_primary"]).pack(side="left", padx=(8, 4))
-        id_entry = ctk.CTkEntry(actions, width=128, placeholder_text="e.g. 12")
+        cancel_actions = ctk.CTkFrame(actions, fg_color="transparent")
+        cancel_actions.pack(side="right")
+        ctk.CTkLabel(cancel_actions, text="Reservation ID", text_color=colors["text_primary"]).pack(side="left", padx=(0, 4))
+        id_entry = ctk.CTkEntry(cancel_actions, width=100, placeholder_text="e.g. 12")
         id_entry.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(actions, text="Cancel Reservation", command=cancel_selected, width=160, **danger_button).pack(side="left")
+        ctk.CTkButton(cancel_actions, text="Cancel", command=cancel_selected, width=100, **danger_button).pack(side="left")
 
         status_label = ctk.CTkLabel(
             self.window,
