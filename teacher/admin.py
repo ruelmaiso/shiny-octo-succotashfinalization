@@ -2052,13 +2052,15 @@ class TeacherDeployUI:
         # =========================
         # 1) TOP BAR — SENSOR PANEL
         # =========================
-        top = ctk.CTkFrame(self.root, height=174, fg_color=CARD_BG, border_width=1, border_color=BORDER_SUBTLE)
+        # Keep the original compact dashboard footprint while retaining the
+        # two-row responsive metric grid below.
+        top = ctk.CTkFrame(self.root, height=122, fg_color=CARD_BG, border_width=1, border_color=BORDER_SUBTLE)
         self.top_bar = top
         top.pack(fill="x", padx=12, pady=(10, 6))
         top.pack_propagate(False)
 
         title_row = ctk.CTkFrame(top, fg_color="transparent")
-        title_row.pack(fill="x", padx=16, pady=(10, 6))
+        title_row.pack(fill="x", padx=16, pady=(6, 2))
         # UI POLISH ONLY
         self.top_title_label = ctk.CTkLabel(
             title_row,
@@ -2115,7 +2117,7 @@ class TeacherDeployUI:
         self.selected_history_button.pack(side="right")
 
         sensor_row = ctk.CTkFrame(top, fg_color="transparent")
-        sensor_row.pack(fill="x", padx=18, pady=(0, 12))
+        sensor_row.pack(fill="x", padx=18, pady=(0, 4))
 
         self.sensor_value_labels: dict[str, ctk.CTkLabel] = {}
         self.sensor_title_labels: list[ctk.CTkLabel] = []
@@ -2143,11 +2145,17 @@ class TeacherDeployUI:
             sensor_row.grid_columnconfigure(column, weight=1, uniform="sensor")
         for index, (key, title, initial) in enumerate(sensor_fields):
             block = ctk.CTkFrame(sensor_row, fg_color="transparent")
-            block.grid(row=index // sensor_columns, column=index % sensor_columns, sticky="ew", padx=10, pady=4)
-            title_label = ctk.CTkLabel(block, text=title, font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_SECONDARY)
+            block.grid(row=index // sensor_columns, column=index % sensor_columns, sticky="ew", padx=10, pady=1)
+            title_label = ctk.CTkLabel(
+                block, text=title, height=16,
+                font=(self.FONT_FAMILY, 11, "bold"), text_color=TEXT_SECONDARY,
+            )
             title_label.pack(anchor="w")
             self.sensor_title_labels.append(title_label)
-            value_label = ctk.CTkLabel(block, text=initial, font=(self.FONT_FAMILY, 12), text_color=TEXT_PRIMARY)
+            value_label = ctk.CTkLabel(
+                block, text=initial, height=16,
+                font=(self.FONT_FAMILY, 11), text_color=TEXT_PRIMARY,
+            )
             value_label.pack(anchor="w")
             self.sensor_value_labels[key] = value_label
 
@@ -2184,12 +2192,12 @@ class TeacherDeployUI:
         # =========================
         # 3) BOTTOM ACTION PANEL (original fixed height)
         # =========================
-        bottom = ctk.CTkFrame(self.root, height=116, fg_color=CARD_BG, border_width=1, border_color=BORDER_SUBTLE)
+        bottom = ctk.CTkFrame(self.root, height=86, fg_color=CARD_BG, border_width=1, border_color=BORDER_SUBTLE)
         self.bottom_bar = bottom
         bottom.pack(fill="x", padx=10, pady=(6, 8))
         bottom.pack_propagate(False)
 
-        self.selection_section = ctk.CTkFrame(bottom, width=330, fg_color=CARD_BG)
+        self.selection_section = ctk.CTkFrame(bottom, width=430, fg_color=CARD_BG)
         self.selection_section.pack(side="left", fill="both", expand=False, padx=(8, 4), pady=5)
         self.selection_section.pack_propagate(False)
         self.selection_header = ctk.CTkFrame(self.selection_section, fg_color="transparent")
@@ -2206,10 +2214,10 @@ class TeacherDeployUI:
         self.selection_divider.pack(side="left", fill="y", padx=(2, 8), pady=12)
 
         self.action_controls_frame = ctk.CTkFrame(bottom, fg_color=CARD_BG)
-        self.action_controls_frame.pack(side="left", fill="both", expand=True, padx=12, pady=10)
+        self.action_controls_frame.pack(side="left", fill="both", expand=True, padx=8, pady=3)
 
         action_group = ctk.CTkFrame(self.action_controls_frame, fg_color="transparent")
-        action_group.pack(fill="x", padx=(8, 6), pady=(0, 6))
+        action_group.pack(fill="x", padx=(4, 4), pady=(0, 2))
         self.lock_mode_label = ctk.CTkLabel(action_group, text="Action Mode", font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_SECONDARY)
         self.lock_mode_label.pack(side="left", padx=(0, 6))
         self.lock_mode_var = ctk.StringVar(value="Temporary Lock")
@@ -2228,7 +2236,7 @@ class TeacherDeployUI:
         self.lock_mode_var.trace_add("write", lambda *_args: self._refresh_control_buttons())
 
         timer_group = ctk.CTkFrame(self.action_controls_frame, fg_color="transparent")
-        timer_group.pack(fill="x", padx=(8, 6))
+        timer_group.pack(fill="x", padx=(4, 4))
         self.timer_title_label = ctk.CTkLabel(timer_group, text="Extend Session", font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_SECONDARY)
         self.timer_title_label.pack(side="left", padx=(0, 8))
         self.timer_entry = ctk.CTkEntry(timer_group, placeholder_text="Minutes", width=92, height=34, fg_color="#FAFAFA", border_color=BORDER_SUBTLE, text_color=TEXT_PRIMARY)
@@ -2239,14 +2247,14 @@ class TeacherDeployUI:
         self.cancel_timer_btn.pack(side="left", padx=4)
 
         self.right_controls_frame = ctk.CTkFrame(bottom, width=190, fg_color=CARD_BG)
-        self.right_controls_frame.pack(side="right", fill="y", expand=False, padx=(4, 10), pady=10)
+        self.right_controls_frame.pack(side="right", fill="y", expand=False, padx=(4, 10), pady=3)
         self.right_controls_frame.pack_propagate(False)
-        self.dashboard_hint_title = ctk.CTkLabel(self.right_controls_frame, text="Quick Guide", font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_PRIMARY, anchor="w")
-        self.dashboard_hint_title.pack(fill="x", padx=10, pady=(6, 2))
-        self.dashboard_hint_label = ctk.CTkLabel(self.right_controls_frame, text="Select a tile to focus it or tick one or more targets.", font=(self.FONT_FAMILY, 11), text_color=TEXT_SECONDARY, anchor="w", justify="left", wraplength=160)
-        self.dashboard_hint_label.pack(fill="x", padx=10, pady=(0, 4))
-        self.runtime_notice_label = ctk.CTkLabel(self.right_controls_frame, text=self._runtime_notice_default, font=(self.FONT_FAMILY, 11), text_color=TEXT_SECONDARY, anchor="w", justify="left", wraplength=160)
-        self.runtime_notice_label.pack(fill="x", padx=10, pady=(0, 6))
+        self.dashboard_hint_title = ctk.CTkLabel(self.right_controls_frame, text="Quick Guide", height=16, font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_PRIMARY, anchor="w")
+        self.dashboard_hint_title.pack(fill="x", padx=10, pady=(2, 0))
+        self.dashboard_hint_label = ctk.CTkLabel(self.right_controls_frame, text="Select a tile to focus it or tick one or more targets.", height=32, font=(self.FONT_FAMILY, 11), text_color=TEXT_SECONDARY, anchor="w", justify="left", wraplength=160)
+        self.dashboard_hint_label.pack(fill="x", padx=10, pady=(0, 1))
+        self.runtime_notice_label = ctk.CTkLabel(self.right_controls_frame, text=self._runtime_notice_default, height=16, font=(self.FONT_FAMILY, 11), text_color=TEXT_SECONDARY, anchor="w", justify="left", wraplength=160)
+        self.runtime_notice_label.pack(fill="x", padx=10, pady=(0, 2))
 
 
 
