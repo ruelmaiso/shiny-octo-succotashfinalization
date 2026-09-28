@@ -2012,6 +2012,7 @@ class TeacherDeployUI:
         screen_w = max(1024, int(self.root.winfo_screenwidth()))
         screen_h = max(768, int(self.root.winfo_screenheight()))
         compact_dashboard = screen_w < 1600
+        narrow_dashboard = screen_w < 1280
         init_w = min(screen_w, int(screen_w * 0.95))
         init_h = min(screen_h, int(screen_h * 0.90))
         self.root.geometry(f"{init_w}x{init_h}+20+20")
@@ -2187,13 +2188,14 @@ class TeacherDeployUI:
         # =========================
         # 3) BOTTOM ACTION PANEL (original fixed height)
         # =========================
-        bottom = ctk.CTkFrame(self.root, height=64, fg_color=CARD_BG, border_width=1, border_color=BORDER_SUBTLE)
+        bottom = ctk.CTkFrame(self.root, height=74, fg_color=CARD_BG, border_width=1, border_color=BORDER_SUBTLE)
         self.bottom_bar = bottom
         bottom.pack(fill="x", padx=10, pady=(4, 6))
         bottom.pack_propagate(False)
 
-        self.selection_section = ctk.CTkFrame(bottom, width=330 if compact_dashboard else 430, fg_color=CARD_BG)
-        self.selection_section.pack(side="left", fill="both", expand=False, padx=(8, 4), pady=3)
+        selection_width = 250 if narrow_dashboard else (330 if compact_dashboard else 430)
+        self.selection_section = ctk.CTkFrame(bottom, width=selection_width, fg_color=CARD_BG)
+        self.selection_section.pack(side="left", fill="both", expand=False, padx=(8, 4), pady=5)
         self.selection_section.pack_propagate(False)
         self.selection_header = ctk.CTkFrame(self.selection_section, fg_color="transparent")
         self.selection_header.pack(fill="both", expand=True)
@@ -2207,43 +2209,45 @@ class TeacherDeployUI:
         self._build_pc_choices_popup()
 
         self.selection_divider = ctk.CTkFrame(bottom, width=1, fg_color=BORDER_SUBTLE)
-        self.selection_divider.pack(side="left", fill="y", padx=(2, 8), pady=7)
+        self.selection_divider.pack(side="left", fill="y", padx=(2, 6), pady=8)
 
         self.action_controls_frame = ctk.CTkFrame(bottom, fg_color=CARD_BG)
-        self.action_controls_frame.pack(side="left", fill="both", expand=True, padx=8, pady=3)
+        self.action_controls_frame.pack(side="left", fill="both", expand=True, padx=6, pady=5)
 
         action_group = ctk.CTkFrame(self.action_controls_frame, fg_color="transparent")
-        action_group.pack(side="left", padx=(2, 6) if compact_dashboard else (8, 16))
-        self.lock_mode_label = ctk.CTkLabel(action_group, text="Action Mode", height=18, font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_SECONDARY)
+        action_group.pack(side="left", padx=(0, 3) if narrow_dashboard else ((2, 6) if compact_dashboard else (8, 16)))
+        action_label_size = 10 if narrow_dashboard else 12
+        self.lock_mode_label = ctk.CTkLabel(action_group, text="Action Mode", height=18, font=(self.FONT_FAMILY, action_label_size, "bold"), text_color=TEXT_SECONDARY)
         self.lock_mode_label.grid(row=0, column=0, columnspan=3, sticky="w")
         self.lock_mode_var = ctk.StringVar(value="Temporary Lock")
         self.lock_mode_menu = ctk.CTkOptionMenu(
             action_group,
             variable=self.lock_mode_var,
             values=["Temporary Lock", "Lock + Sign Out", "Shutdown", "Restart"],
-            width=145 if compact_dashboard else 178,
+            width=125 if narrow_dashboard else (145 if compact_dashboard else 178),
             height=28,
         )
         self.lock_mode_menu.grid(row=1, column=0, padx=(0, 4))
-        self.lock_btn = ctk.CTkButton(action_group, text="Apply Lock Mode", command=self._lock_targets, width=120 if compact_dashboard else 150, height=28, **BUTTON_PRIMARY)
+        self.lock_btn = ctk.CTkButton(action_group, text="Apply Lock Mode", command=self._lock_targets, width=105 if narrow_dashboard else (120 if compact_dashboard else 150), height=28, **BUTTON_PRIMARY)
         self.lock_btn.grid(row=1, column=1, padx=4)
-        self.unlock_btn = ctk.CTkButton(action_group, text="Unlock", command=self._unlock_targets, width=85 if compact_dashboard else 110, height=28, **BUTTON_NEUTRAL)
+        self.unlock_btn = ctk.CTkButton(action_group, text="Unlock", command=self._unlock_targets, width=70 if narrow_dashboard else (85 if compact_dashboard else 110), height=28, **BUTTON_NEUTRAL)
         self.unlock_btn.grid(row=1, column=2, padx=4)
         self.lock_mode_var.trace_add("write", lambda *_args: self._refresh_control_buttons())
 
         timer_group = ctk.CTkFrame(self.action_controls_frame, fg_color="transparent")
-        timer_group.pack(side="left", padx=(4, 2) if compact_dashboard else (12, 6))
-        self.timer_title_label = ctk.CTkLabel(timer_group, text="Extend Session", height=18, font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_SECONDARY)
+        timer_group.pack(side="left", padx=(2, 0) if narrow_dashboard else ((4, 2) if compact_dashboard else (12, 6)))
+        self.timer_title_label = ctk.CTkLabel(timer_group, text="Extend Session", height=18, font=(self.FONT_FAMILY, action_label_size, "bold"), text_color=TEXT_SECONDARY)
         self.timer_title_label.grid(row=0, column=0, columnspan=3, sticky="w")
-        self.timer_entry = ctk.CTkEntry(timer_group, placeholder_text="Minutes", width=72 if compact_dashboard else 92, height=28, fg_color="#FAFAFA", border_color=BORDER_SUBTLE, text_color=TEXT_PRIMARY)
+        self.timer_entry = ctk.CTkEntry(timer_group, placeholder_text="Minutes", width=60 if narrow_dashboard else (72 if compact_dashboard else 92), height=28, fg_color="#FAFAFA", border_color=BORDER_SUBTLE, text_color=TEXT_PRIMARY)
         self.timer_entry.grid(row=1, column=0, padx=(0, 4))
-        self.extend_timer_btn = ctk.CTkButton(timer_group, text="Extend", command=self._extend_timer, width=76 if compact_dashboard else 96, height=28, **BUTTON_WARNING)
+        self.extend_timer_btn = ctk.CTkButton(timer_group, text="Extend", command=self._extend_timer, width=65 if narrow_dashboard else (76 if compact_dashboard else 96), height=28, **BUTTON_WARNING)
         self.extend_timer_btn.grid(row=1, column=1, padx=4)
-        self.cancel_timer_btn = ctk.CTkButton(timer_group, text="Cancel", command=self._cancel_timer, width=76 if compact_dashboard else 96, height=28, **BUTTON_NEUTRAL)
+        self.cancel_timer_btn = ctk.CTkButton(timer_group, text="Cancel", command=self._cancel_timer, width=65 if narrow_dashboard else (76 if compact_dashboard else 96), height=28, **BUTTON_NEUTRAL)
         self.cancel_timer_btn.grid(row=1, column=2, padx=4)
 
         self.right_controls_frame = ctk.CTkFrame(bottom, width=170 if compact_dashboard else 190, fg_color=CARD_BG)
-        self.right_controls_frame.pack(side="right", fill="y", expand=False, padx=(4, 10), pady=3)
+        if not narrow_dashboard:
+            self.right_controls_frame.pack(side="right", fill="y", expand=False, padx=(4, 10), pady=5)
         self.right_controls_frame.pack_propagate(False)
         self.dashboard_hint_title = ctk.CTkLabel(self.right_controls_frame, text="Quick Guide", height=14, font=(self.FONT_FAMILY, 11, "bold"), text_color=TEXT_PRIMARY, anchor="w")
         self.dashboard_hint_title.pack(fill="x", padx=8)
