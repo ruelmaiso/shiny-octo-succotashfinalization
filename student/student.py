@@ -377,21 +377,37 @@ class OverlayController:
                 register_entries[key] = entry
 
             status_reg = ctk.CTkLabel(card, text="", font=("Arial", 12), text_color="#EF4444")
-            status_reg.pack(pady=(10, 0))
+            status_reg.configure(wraplength=420, justify="center")
+            status_reg.pack(pady=(10, 0), padx=40)
 
             def on_register() -> None:
                 payload = {k: e.get().strip() for k, e in register_entries.items()}
                 if not all(payload.values()):
                     status_reg.configure(text="Please complete all fields.", text_color="#EF4444")
                     return
-                resp = send_register(payload)
-                if resp is None:
-                    self._auth_result_q.put(None)
-                    return
-                if resp.get("ok"):
-                    switch_to_login("Registration successful. Please login.", "#10B981")
-                    return
-                status_reg.configure(text="Registration failed. Please check fields and try again.", text_color="#EF4444")
+                register_btn.configure(state="disabled", text="Creating account...")
+                back_btn.configure(state="disabled")
+                status_reg.configure(text="Contacting the teacher server...", text_color="#60A5FA")
+
+                def finish(resp: Optional[dict]) -> None:
+                    if not card.winfo_exists():
+                        return
+                    register_btn.configure(state="normal", text="Register")
+                    back_btn.configure(state="normal")
+                    if resp is None:
+                        status_reg.configure(text="Connection lost. Reconnecting automatically...", text_color="#EF4444")
+                        self._auth_result_q.put(None)
+                    elif resp.get("ok"):
+                        switch_to_login("Registration successful. Please log in.", "#10B981")
+                    else:
+                        status_reg.configure(text="Registration failed. Check the fields and try again.", text_color="#EF4444")
+
+                def worker() -> None:
+                    response = send_register(payload)
+                    if self._root is not None:
+                        self._root.after(0, lambda: finish(response))
+
+                threading.Thread(target=worker, daemon=True, name="student-register").start()
 
             register_btn = ctk.CTkButton(card, text="Register", command=on_register, width=420)
             style_primary(register_btn)
@@ -400,6 +416,8 @@ class OverlayController:
             back_btn = ctk.CTkButton(card, text="Back to Login", command=lambda: switch_to_login("", "#EF4444"), width=420)
             style_secondary(back_btn)
             back_btn.pack(pady=(0, 32))
+            register_entries["password"].bind("<Return>", lambda _event: on_register())
+            register_entries["full_name"].focus_set()
 
         def switch_to_login(initial_text: str = "", color: str = "#EF4444") -> None:
             clear_card()
@@ -416,26 +434,41 @@ class OverlayController:
             pw.pack(padx=40, pady=(0, 8))
 
             status_login = ctk.CTkLabel(card, text=initial_text, font=("Arial", 12), text_color=color)
-            status_login.pack(pady=(10, 0))
+            status_login.configure(wraplength=420, justify="center")
+            status_login.pack(pady=(10, 0), padx=40)
 
             def on_login() -> None:
                 payload = {"student_number": sn.get().strip(), "password": pw.get().strip()}
                 if not payload["student_number"] or not payload["password"]:
                     status_login.configure(text="Student number and password are required.", text_color="#EF4444")
                     return
-                resp = send_login(payload)
-                if resp is None:
-                    self._auth_result_q.put(None)
-                    return
-                if resp.get("ok") and isinstance(resp.get("user"), dict):
-                    self._auth_result_q.put(resp.get("user"))
-                    return
-                if resp.get("reason") == "reserved_for_another_student":
-                    msg = str(resp.get("message") or "This workstation is reserved for another during this time.")
-                    status_login.configure(text=msg, text_color="#EF4444")
-                    self.notify_message_async(msg)
-                    return
-                status_login.configure(text="Invalid credentials. Please try again.", text_color="#EF4444")
+                login_btn.configure(state="disabled", text="Signing in...")
+                register_btn.configure(state="disabled")
+                status_login.configure(text="Contacting the teacher server...", text_color="#60A5FA")
+
+                def finish(resp: Optional[dict]) -> None:
+                    if not card.winfo_exists():
+                        return
+                    login_btn.configure(state="normal", text="Login")
+                    register_btn.configure(state="normal")
+                    if resp is None:
+                        status_login.configure(text="Connection lost. Reconnecting automatically...", text_color="#EF4444")
+                        self._auth_result_q.put(None)
+                    elif resp.get("ok") and isinstance(resp.get("user"), dict):
+                        self._auth_result_q.put(resp.get("user"))
+                    elif resp.get("reason") == "reserved_for_another_student":
+                        msg = str(resp.get("message") or "This workstation is reserved for another student at this time.")
+                        status_login.configure(text=msg, text_color="#EF4444")
+                        self.notify_message_async(msg)
+                    else:
+                        status_login.configure(text="Invalid credentials. Please try again.", text_color="#EF4444")
+
+                def worker() -> None:
+                    response = send_login(payload)
+                    if self._root is not None:
+                        self._root.after(0, lambda: finish(response))
+
+                threading.Thread(target=worker, daemon=True, name="student-login").start()
 
             login_btn = ctk.CTkButton(card, text="Login", command=on_login, width=420)
             style_primary(login_btn)
@@ -444,6 +477,8 @@ class OverlayController:
             register_btn = ctk.CTkButton(card, text="Register", command=switch_to_register, width=420)
             style_secondary(register_btn)
             register_btn.pack(pady=(0, 34))
+            pw.bind("<Return>", lambda _event: on_login())
+            sn.focus_set()
 
         switch_to_login()
 
@@ -1930,8 +1965,10 @@ class StudentDeployClient:
             return self._restore_overlay_state()
 
     def _connect_control(self) -> bool:
+        sock: Optional[socket.socket] = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(8.0)
             sock.connect((self.teacher_ip, NETWORK.control_port))
             file_obj = sock.makefile("rb")
             with self.conn_lock:
@@ -1942,6 +1979,7 @@ class StudentDeployClient:
             if not ack or ack.get("type") != "register_ack":
                 self._cleanup_sockets()
                 return False
+            sock.settimeout(None)
             self.pc_id = str(ack.get("pc_id"))
             self.enable_session_messaging = bool(ack.get("enable_session_messaging", False))
             self.enable_extension_requests = bool(ack.get("enable_extension_requests", False))
@@ -1958,20 +1996,33 @@ class StudentDeployClient:
                 return False
             return True
         except (OSError, ValueError):
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
             self._cleanup_sockets()
             return False
 
     def _connect_video(self) -> bool:
         if not self.pc_id:
             return False
+        sock: Optional[socket.socket] = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(8.0)
             sock.connect((self.teacher_ip, NETWORK.video_port))
             send_json(sock, {"type": "video_register", "pc_id": self.pc_id})
+            sock.settimeout(None)
             with self.conn_lock:
                 self.video_sock = sock
             return True
         except OSError:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
             return False
 
     def _cleanup_sockets(self) -> None:
@@ -2226,7 +2277,6 @@ def main() -> None:
     settings_store = StudentSettingsStore(default_teacher_host=NETWORK.teacher_connect_host)
     settings = settings_store.load()
     client = StudentDeployClient(settings.teacher_host, settings_store=settings_store)
-    client = StudentDeployClient(NETWORK.teacher_host)
     try:
         client.run()
     except KeyboardInterrupt:
