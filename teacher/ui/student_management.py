@@ -98,7 +98,8 @@ class StudentManagementPanel:
         win.focus_force()
         win.grab_set()
         win.title("Add Student")
-        win.geometry("420x320")
+        win.geometry("440x430")
+        win.resizable(False, False)
         win.configure(fg_color=colors["card_bg"])
 
         # UI POLISH ONLY
@@ -163,7 +164,8 @@ class StudentManagementPanel:
         win.focus_force()
         win.grab_set()
         win.title("Reset Password")
-        win.geometry("420x220")
+        win.geometry("440x330")
+        win.resizable(False, False)
         win.configure(fg_color=colors["card_bg"])
 
         # UI POLISH ONLY
@@ -218,7 +220,8 @@ class StudentManagementPanel:
         win.focus_force()
         win.grab_set()
         win.title("Delete Student")
-        win.geometry("420x180")
+        win.geometry("440x260")
+        win.resizable(False, False)
         win.configure(fg_color=colors["card_bg"])
 
         # UI POLISH ONLY
