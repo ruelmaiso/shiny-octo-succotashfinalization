@@ -17,7 +17,6 @@ from typing import Optional
 
 import cv2
 import customtkinter as ctk
-import mss
 import numpy
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
@@ -29,7 +28,7 @@ from config.deploy_settings import NETWORK, RUNTIME
 from core.auth_db import AuthDatabase
 from core.client_registry import ClientRegistry
 from core.heartbeat import HeartbeatState
-from core.protocol import recv_frame, recv_json_line, send_frame, send_json
+from core.protocol import recv_frame, recv_json_line, send_json
 from core.screen_share import ScreenShareBroadcaster
 from core.app_settings import AppSettings, SettingsStore
 from teacher.reservations import ReservationManager
@@ -1378,7 +1377,6 @@ class TeacherDeployServer:
             role = str(reg.get("role", "uplink")).strip().lower() or "uplink"
             if role != "uplink":
                 return
-            registration_diag: dict[str, object] = {"pc_id": pc_id, "role": role, "accepted_socket_id": id(client_sock)}
             with self.lock:
                 if pc_id not in self.clients:
                     self._log_event("video_registration_unknown_client", pc_id=pc_id)
@@ -2013,6 +2011,8 @@ class TeacherDeployUI:
         self.root.title("IoT-Based Smart Laboratory Management System")
         screen_w = max(1024, int(self.root.winfo_screenwidth()))
         screen_h = max(768, int(self.root.winfo_screenheight()))
+        compact_dashboard = screen_w < 1600
+        narrow_dashboard = screen_w < 1280
         init_w = min(screen_w, int(screen_w * 0.95))
         init_h = min(screen_h, int(screen_h * 0.90))
         self.root.geometry(f"{init_w}x{init_h}+20+20")
@@ -2052,7 +2052,7 @@ class TeacherDeployUI:
         )
 
         # =========================
-        # 1) TOP BAR (Fixed Height = 160) — SENSOR PANEL
+        # 1) TOP BAR — SENSOR PANEL
         # =========================
         top = ctk.CTkFrame(self.root, height=122, fg_color=CARD_BG, border_width=1, border_color=BORDER_SUBTLE)
         self.top_bar = top
@@ -2139,13 +2139,15 @@ class TeacherDeployUI:
             ("system", "System Online", "--"),
         ]
         group_breaks = {"uptime", "session_left"}
+        sensor_pad_x = 5 if compact_dashboard else 22
+        sensor_font_size = 10 if compact_dashboard else 12
         for key, title, initial in sensor_fields:
             block = ctk.CTkFrame(sensor_row, fg_color="transparent")
-            block.pack(side="left", padx=22)
-            title_label = ctk.CTkLabel(block, text=title, font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_SECONDARY)
+            block.pack(side="left", fill="x", expand=True, padx=sensor_pad_x)
+            title_label = ctk.CTkLabel(block, text=title, font=(self.FONT_FAMILY, sensor_font_size, "bold"), text_color=TEXT_SECONDARY)
             title_label.pack(anchor="w")
             self.sensor_title_labels.append(title_label)
-            value_label = ctk.CTkLabel(block, text=initial, font=(self.FONT_FAMILY, 12), text_color=TEXT_PRIMARY)
+            value_label = ctk.CTkLabel(block, text=initial, font=(self.FONT_FAMILY, sensor_font_size), text_color=TEXT_PRIMARY)
             value_label.pack(anchor="w")
             self.sensor_value_labels[key] = value_label
             if key in group_breaks:
@@ -2186,69 +2188,73 @@ class TeacherDeployUI:
         # =========================
         # 3) BOTTOM ACTION PANEL (original fixed height)
         # =========================
-        bottom = ctk.CTkFrame(self.root, height=86, fg_color=CARD_BG, border_width=1, border_color=BORDER_SUBTLE)
+        bottom = ctk.CTkFrame(self.root, height=74, fg_color=CARD_BG, border_width=1, border_color=BORDER_SUBTLE)
         self.bottom_bar = bottom
-        bottom.pack(fill="x", padx=10, pady=(6, 8))
+        bottom.pack(fill="x", padx=10, pady=(4, 6))
         bottom.pack_propagate(False)
 
-        self.selection_section = ctk.CTkFrame(bottom, width=430, fg_color=CARD_BG)
+        selection_width = 250 if narrow_dashboard else (330 if compact_dashboard else 430)
+        self.selection_section = ctk.CTkFrame(bottom, width=selection_width, fg_color=CARD_BG)
         self.selection_section.pack(side="left", fill="both", expand=False, padx=(8, 4), pady=5)
         self.selection_section.pack_propagate(False)
         self.selection_header = ctk.CTkFrame(self.selection_section, fg_color="transparent")
-        self.selection_header.pack(fill="x")
-        self.pc_selection_label = ctk.CTkLabel(self.selection_header, text="PC Selection", font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_SECONDARY)
-        self.pc_selection_label.pack(side="left")
-        self.selection_summary_label = ctk.CTkLabel(self.selection_header, text="Selected: None", font=(self.FONT_FAMILY, 11), text_color=TEXT_SECONDARY, anchor="w")
-        self.selection_summary_label.pack(side="left", padx=(14, 0))
+        self.selection_header.pack(fill="both", expand=True)
+        self.selection_header.grid_columnconfigure(0, weight=1)
+        self.pc_selection_label = ctk.CTkLabel(self.selection_header, text="PC Selection", height=18, font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_SECONDARY)
+        self.pc_selection_label.grid(row=0, column=0, sticky="w")
+        self.selection_summary_label = ctk.CTkLabel(self.selection_header, text="Selected: None", height=18, font=(self.FONT_FAMILY, 11), text_color=TEXT_SECONDARY, anchor="w")
+        self.selection_summary_label.grid(row=1, column=0, sticky="w")
         self.collapse_panel_btn = ctk.CTkButton(self.selection_header, text="Show PCs ▼", command=self._toggle_bottom_panel, width=94, height=28, **BUTTON_NEUTRAL)
-        self.collapse_panel_btn.pack(side="right")
+        self.collapse_panel_btn.grid(row=1, column=1, sticky="e", padx=(8, 0))
         self._build_pc_choices_popup()
 
         self.selection_divider = ctk.CTkFrame(bottom, width=1, fg_color=BORDER_SUBTLE)
-        self.selection_divider.pack(side="left", fill="y", padx=(2, 8), pady=12)
+        self.selection_divider.pack(side="left", fill="y", padx=(2, 6), pady=8)
 
         self.action_controls_frame = ctk.CTkFrame(bottom, fg_color=CARD_BG)
-        self.action_controls_frame.pack(side="left", fill="both", expand=True, padx=12, pady=10)
+        self.action_controls_frame.pack(side="left", fill="both", expand=True, padx=6, pady=5)
 
         action_group = ctk.CTkFrame(self.action_controls_frame, fg_color="transparent")
-        action_group.pack(side="left", padx=(8, 16))
-        self.lock_mode_label = ctk.CTkLabel(action_group, text="Action Mode", font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_SECONDARY)
-        self.lock_mode_label.pack(side="left", padx=(0, 6))
+        action_group.pack(side="left", padx=(0, 3) if narrow_dashboard else ((2, 6) if compact_dashboard else (8, 16)))
+        action_label_size = 10 if narrow_dashboard else 12
+        self.lock_mode_label = ctk.CTkLabel(action_group, text="Action Mode", height=18, font=(self.FONT_FAMILY, action_label_size, "bold"), text_color=TEXT_SECONDARY)
+        self.lock_mode_label.grid(row=0, column=0, columnspan=3, sticky="w")
         self.lock_mode_var = ctk.StringVar(value="Temporary Lock")
         self.lock_mode_menu = ctk.CTkOptionMenu(
             action_group,
             variable=self.lock_mode_var,
             values=["Temporary Lock", "Lock + Sign Out", "Shutdown", "Restart"],
-            width=178,
-            height=34,
+            width=125 if narrow_dashboard else (145 if compact_dashboard else 178),
+            height=28,
         )
-        self.lock_mode_menu.pack(side="left", padx=4)
-        self.lock_btn = ctk.CTkButton(action_group, text="Apply Lock Mode", command=self._lock_targets, width=150, height=34, **BUTTON_PRIMARY)
-        self.lock_btn.pack(side="left", padx=4)
-        self.unlock_btn = ctk.CTkButton(action_group, text="Unlock", command=self._unlock_targets, width=110, height=34, **BUTTON_NEUTRAL)
-        self.unlock_btn.pack(side="left", padx=4)
+        self.lock_mode_menu.grid(row=1, column=0, padx=(0, 4))
+        self.lock_btn = ctk.CTkButton(action_group, text="Apply Lock Mode", command=self._lock_targets, width=105 if narrow_dashboard else (120 if compact_dashboard else 150), height=28, **BUTTON_PRIMARY)
+        self.lock_btn.grid(row=1, column=1, padx=4)
+        self.unlock_btn = ctk.CTkButton(action_group, text="Unlock", command=self._unlock_targets, width=70 if narrow_dashboard else (85 if compact_dashboard else 110), height=28, **BUTTON_NEUTRAL)
+        self.unlock_btn.grid(row=1, column=2, padx=4)
         self.lock_mode_var.trace_add("write", lambda *_args: self._refresh_control_buttons())
 
         timer_group = ctk.CTkFrame(self.action_controls_frame, fg_color="transparent")
-        timer_group.pack(side="left", padx=(12, 6))
-        self.timer_title_label = ctk.CTkLabel(timer_group, text="Extend Session", font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_SECONDARY)
-        self.timer_title_label.pack(side="left", padx=(0, 8))
-        self.timer_entry = ctk.CTkEntry(timer_group, placeholder_text="Minutes", width=92, height=34, fg_color="#FAFAFA", border_color=BORDER_SUBTLE, text_color=TEXT_PRIMARY)
-        self.timer_entry.pack(side="left", padx=4)
-        self.extend_timer_btn = ctk.CTkButton(timer_group, text="Extend", command=self._extend_timer, width=96, height=34, **BUTTON_WARNING)
-        self.extend_timer_btn.pack(side="left", padx=4)
-        self.cancel_timer_btn = ctk.CTkButton(timer_group, text="Cancel", command=self._cancel_timer, width=96, height=34, **BUTTON_NEUTRAL)
-        self.cancel_timer_btn.pack(side="left", padx=4)
+        timer_group.pack(side="left", padx=(2, 0) if narrow_dashboard else ((4, 2) if compact_dashboard else (12, 6)))
+        self.timer_title_label = ctk.CTkLabel(timer_group, text="Extend Session", height=18, font=(self.FONT_FAMILY, action_label_size, "bold"), text_color=TEXT_SECONDARY)
+        self.timer_title_label.grid(row=0, column=0, columnspan=3, sticky="w")
+        self.timer_entry = ctk.CTkEntry(timer_group, placeholder_text="Minutes", width=60 if narrow_dashboard else (72 if compact_dashboard else 92), height=28, fg_color="#FAFAFA", border_color=BORDER_SUBTLE, text_color=TEXT_PRIMARY)
+        self.timer_entry.grid(row=1, column=0, padx=(0, 4))
+        self.extend_timer_btn = ctk.CTkButton(timer_group, text="Extend", command=self._extend_timer, width=65 if narrow_dashboard else (76 if compact_dashboard else 96), height=28, **BUTTON_WARNING)
+        self.extend_timer_btn.grid(row=1, column=1, padx=4)
+        self.cancel_timer_btn = ctk.CTkButton(timer_group, text="Cancel", command=self._cancel_timer, width=65 if narrow_dashboard else (76 if compact_dashboard else 96), height=28, **BUTTON_NEUTRAL)
+        self.cancel_timer_btn.grid(row=1, column=2, padx=4)
 
-        self.right_controls_frame = ctk.CTkFrame(bottom, width=190, fg_color=CARD_BG)
-        self.right_controls_frame.pack(side="right", fill="y", expand=False, padx=(4, 10), pady=10)
+        self.right_controls_frame = ctk.CTkFrame(bottom, width=170 if compact_dashboard else 190, fg_color=CARD_BG)
+        if not narrow_dashboard:
+            self.right_controls_frame.pack(side="right", fill="y", expand=False, padx=(4, 10), pady=5)
         self.right_controls_frame.pack_propagate(False)
-        self.dashboard_hint_title = ctk.CTkLabel(self.right_controls_frame, text="Quick Guide", font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_PRIMARY, anchor="w")
-        self.dashboard_hint_title.pack(fill="x", padx=10, pady=(6, 2))
-        self.dashboard_hint_label = ctk.CTkLabel(self.right_controls_frame, text="Select a tile to focus it or tick one or more targets.", font=(self.FONT_FAMILY, 11), text_color=TEXT_SECONDARY, anchor="w", justify="left", wraplength=160)
-        self.dashboard_hint_label.pack(fill="x", padx=10, pady=(0, 4))
-        self.runtime_notice_label = ctk.CTkLabel(self.right_controls_frame, text=self._runtime_notice_default, font=(self.FONT_FAMILY, 11), text_color=TEXT_SECONDARY, anchor="w", justify="left", wraplength=160)
-        self.runtime_notice_label.pack(fill="x", padx=10, pady=(0, 6))
+        self.dashboard_hint_title = ctk.CTkLabel(self.right_controls_frame, text="Quick Guide", height=14, font=(self.FONT_FAMILY, 11, "bold"), text_color=TEXT_PRIMARY, anchor="w")
+        self.dashboard_hint_title.pack(fill="x", padx=8)
+        self.dashboard_hint_label = ctk.CTkLabel(self.right_controls_frame, text="Select a tile to focus it or tick one or more targets.", height=24, font=(self.FONT_FAMILY, 10), text_color=TEXT_SECONDARY, anchor="w", justify="left", wraplength=160)
+        self.dashboard_hint_label.pack(fill="x", padx=8)
+        self.runtime_notice_label = ctk.CTkLabel(self.right_controls_frame, text=self._runtime_notice_default, height=14, font=(self.FONT_FAMILY, 10), text_color=TEXT_SECONDARY, anchor="w", justify="left", wraplength=160)
+        self.runtime_notice_label.pack(fill="x", padx=8)
 
 
 
@@ -4013,20 +4019,7 @@ class TeacherDeployUI:
             elif rem <= warning_rem_s:
                 session_left_color = ESSU_WARNING
 
-        timer_remaining = "--"
         timer_extended = "00:00"
-        with self.server.lock:
-            now = time.time()
-            remaining_values = [
-                max(0, int(timer.duration_ms - ((now - timer.start_ts) * 1000)))
-                for timer in self.server.timers.values()
-                if timer.active and pc_id in timer.targets
-            ]
-        if remaining_values:
-            remaining_ms = min(remaining_values)
-            mins, secs = divmod(remaining_ms // 1000, 60)
-            timer_remaining = f"{mins:02d}:{secs:02d}"
-
         ext_ms = int(self.extended_timer_ms_by_pc.get(pc_id, 0))
         ext_mins, ext_secs = divmod(max(0, ext_ms) // 1000, 60)
         timer_extended = f"{ext_mins:02d}:{ext_secs:02d}"
